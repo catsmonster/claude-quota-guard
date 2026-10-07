@@ -171,11 +171,16 @@ const num = (k: string, d: number) => (typeof options[k] === 'number' ? (options
 
 async function load($: any): Promise<void> {
   await registerCommand($)
-  sid = await $.session.id()
-  const saved = (await $.store.get('state:' + sid)) as State | undefined
-  S = saved && saved.v === 1 ? saved : initialState()
+  // read and build everything into locals first; publish only when all of it succeeded, so a failure
+  // part-way leaves nothing half-initialised for the next hook to mistake for a good start
+  const id = await $.session.id()
+  const saved = (await $.store.get('state:' + id)) as State | undefined
   const o = ((await $.store.get('cfg')) ?? {}) as Overrides
-  cfg = {
+  const idle = ((await $.store.get('idle:' + id)) as typeof idleStats) ?? undefined
+  const simSaved = ((await $.store.get('sim')) as Sim | undefined) ?? null
+
+  const { testMode: tm, dryActions: da, legend: lg, idle: oIdle, ...rest } = o
+  const nextCfg: Config = {
     enabled: typeof options.enabled === 'boolean' ? options.enabled : DEFAULTS.enabled,
     threshold: num('threshold', DEFAULTS.threshold),
     weeklyThreshold: num('weeklyThreshold', DEFAULTS.weeklyThreshold),
@@ -187,23 +192,43 @@ async function load($: any): Promise<void> {
     weeklyPolicy: options.weeklyPolicy === 'notify' ? 'notify' : 'pause',
     notifyAt: num('notifyAt', DEFAULTS.notifyAt),
     compactMinContext: num('compactMinContext', DEFAULTS.compactMinContext),
+    ...rest,
   }
-  testMode = typeof options.testMode === 'boolean' ? options.testMode : false
-  idleCfg = {
+  const nextIdle: IdleCfg = {
     enabled: typeof options.idleCompact === 'boolean' ? options.idleCompact : IDLE_DEFAULTS.enabled,
     minTokens: num('idleCompactMinTokens', IDLE_DEFAULTS.minTokens),
     ttlMs: num('cacheTtlMinutes', IDLE_DEFAULTS.ttlMs / 60_000) * 60_000,
     marginMs: num('idleMarginSeconds', IDLE_DEFAULTS.marginMs / 1000) * 1000,
     requireWaiting: typeof options.idleRequiresBackground === 'boolean' ? options.idleRequiresBackground : IDLE_DEFAULTS.requireWaiting,
-    ...(o.idle ?? {}),
+    ...(oIdle ?? {}),
   }
-  idleStats = ((await $.store.get('idle:' + sid)) as typeof idleStats) ?? undefined
-  const { testMode: tm, dryActions: da, legend: lg, idle: _idle, ...rest } = o
-  cfg = { ...cfg, ...rest }
-  if (typeof tm === 'boolean') testMode = tm
+
+  sid = id
+  cfg = nextCfg
+  idleCfg = nextIdle
+  idleStats = idle
+  sim = simSaved
+  testMode = typeof tm === 'boolean' ? tm : typeof options.testMode === 'boolean' ? options.testMode : false
   if (typeof da === 'boolean') dryActions = da
   if (typeof lg === 'boolean') legend = lg
-  sim = ((await $.store.get('sim')) as Sim | undefined) ?? null
+  S = saved && saved.v === 1 ? saved : initialState() // last: this is what ensure() takes as "loaded"
+  await touchIndex($)
+}
+
+// keep the shared store small: remember the most recent sessions and forget older ones
+async function touchIndex($: any) {
+  try {
+    const now = await $.clock.now()
+    const idx = ((await $.store.get('index')) as { sid: string; at: number }[] | undefined) ?? []
+    const next = [{ sid, at: now }, ...idx.filter(x => x.sid !== sid)]
+    for (const old of next.slice(25)) {
+      await $.store.delete('state:' + old.sid)
+      await $.store.delete('idle:' + old.sid)
+    }
+    await $.store.set('index', next.slice(0, 25))
+  } catch (err) {
+    logOnce($, err)
+  }
 }
 
 // A failure in this mod must never stop prompts or tool calls: hooks catch, log once, and pass through.
@@ -264,7 +289,7 @@ function ensure($: any): Promise<void> {
   return loading
 }
 
-const persist = ($: any) => $.store.set('state:' + sid, S).catch(() => {})
+const persist = ($: any) => $.store.set('state:' + sid, S).catch((err: unknown) => logOnce($, err))
 const saveCfg = ($: any) =>
   $.store.set('cfg', { ...cfg, testMode, dryActions, legend, idle: idleCfg }).catch(() => {})
 const saveSim = ($: any) => $.store.set('sim', sim).catch(() => {})
@@ -434,6 +459,7 @@ async function doCompact($: any, instructions: string) {
     // compact rejects while a turn runs; the turn.complete hook that got us
     // here has not returned yet, so retry until the session is idle.
     for (let i = 0; i < 15 && !ok; i++) {
+      if ((S as State).rec.phase !== 'compacting') return // cancelled or superseded while waiting
       try {
         const r = await $.session.compact({ instructions })
         ok = !r || !('skip' in r) || r.skip === undefined
@@ -452,8 +478,13 @@ async function doSubmit($: any, text: string) {
     $.clock.after(1500, () => void syntheticMeasure($).catch((err: unknown) => logOnce($, err)))
     return
   }
+  // this resume attempt, identified by when it started: anything that cancels, replaces or
+  // supersedes it changes the state, and then the prompt must not be sent
+  const attempt = (S as State).rec.lastResumeAt
+  const stillWanted = () => cfg.enabled && (S as State).rec.phase === 'resuming' && (S as State).rec.lastResumeAt === attempt
   await claimSlot($)
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let tries = 0; tries < 2; tries++) {
+    if (!stillWanted()) return
     try {
       const r = await $.prompt.submit({ text })
       if (!r || r.drop === undefined) return
@@ -462,6 +493,7 @@ async function doSubmit($: any, text: string) {
     }
     await $.clock.sleep(5000)
   }
+  if (!stillWanted()) return
   await dispatch($, { type: 'submitFailed', now: await $.clock.now(), text })
 }
 
@@ -505,7 +537,7 @@ async function contextTokens($: any): Promise<number | undefined> {
 async function scheduleIdle($: any) {
   idleTimer?.cancel()
   idleTimer = undefined
-  if (!idleCfg.enabled || lastResponseAt === undefined) return
+  if (!idleCfg.enabled || lastResponseAt === undefined || (testMode && dryActions)) return
   const now = await $.clock.now()
   const plan = planIdleCompact(idleCfg, {
     now,
@@ -525,6 +557,7 @@ async function scheduleIdle($: any) {
 async function runIdle($: any) {
   idleTimer = undefined
   await ensure($)
+  if (testMode && dryActions) return // dry-run: never touch the real conversation
   const now = await $.clock.now()
   const tokens = await contextTokens($)
   const plan = planIdleCompact(idleCfg, {
@@ -752,7 +785,7 @@ export const register: Register = (on, opts) => {
       try {
         const now = await $.clock.now()
         const usage = testMode ? await readUsage($) : mapUsage(e)
-        if (usage && usage.windows.length) {
+        if (usage) {
           await dispatch($, { type: 'measure', now, usage })
           $.ui.status(statusLine(S as State, usage, now))
           await publish($, usage, now)
@@ -783,7 +816,7 @@ export const register: Register = (on, opts) => {
       try {
         // detached: this hook must return before a compaction can run
         const at = await $.clock.now()
-        lastResponseAt = at
+        if (e.reason === 'answer' || e.reason === 'refusal') lastResponseAt = at // an errored or interrupted turn refreshed nothing
         void dispatch($, { type: 'turnComplete', now: at, reason: e.reason })
           .then(() => scheduleIdle($))
           .catch((err: unknown) => logOnce($, err))
@@ -795,15 +828,16 @@ export const register: Register = (on, opts) => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (e.origin.kind === 'plugin' || !(await usable($))) return next(e)
+    const kind = e.origin?.kind
+    if ((kind === 'plugin' && e.origin?.name === $.plugin.name) || !(await usable($))) return next(e)
     try {
       idleTimer?.cancel()
       idleTimer = undefined
-      if (e.origin.kind === 'task-notification') waiting = clearOnNotification(waiting, e.text)
-      const isUser = USER_KINDS.includes(e.origin.kind)
+      const isUser = kind !== undefined && USER_KINDS.includes(kind)
       if (!isUser && cfg.enabled && blocksAutomation(S as State)) {
         return { drop: PREFIX + 'paused for a usage limit; automatic prompts are held.' }
       }
+      if (kind === 'task-notification') waiting = clearOnNotification(waiting, e.text)
       lastText = e.text
       await dispatch($, { type: 'userPrompt', now: await $.clock.now(), text: e.text, isUser })
     } catch (err) {
@@ -815,7 +849,7 @@ export const register: Register = (on, opts) => {
   on('session.compact', async ($, e, next) => {
     const r = await next(e)
     try {
-      if (e.trigger !== 'precompute' && r && r.skip === undefined && (await usable($))) {
+      if (e.agentId === undefined && e.trigger !== 'precompute' && r && r.skip === undefined && (await usable($))) {
         // our own compaction is reported by doCompact; this catches everyone else's
         if ((S as State).rec.phase !== 'compacting') {
           await dispatch($, { type: 'compactDone', now: await $.clock.now(), ok: true, external: true })
@@ -829,7 +863,7 @@ export const register: Register = (on, opts) => {
 
   on('tool.call', async ($, e, next) => {
     try {
-      if ((await usable($)) && cfg.enabled && (S as State).rec.phase === 'paused') {
+      if ((await usable($)) && cfg.enabled && (S as State).rec.phase === 'paused' && (await watched($))) {
         return { deny: PREFIX + 'paused until the usage limit resets.' }
       }
       if (e.agentId === undefined) {

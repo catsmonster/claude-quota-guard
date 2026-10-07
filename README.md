@@ -119,6 +119,9 @@ No need to burn real quota:
 - Pause records are keyed by session id.
 - Weekly pauses can last days and only resume while the session stays loaded.
 - Compaction needs an API call, so at 100% it can fail; the mod then pauses anyway.
+- Automatic prompts (scheduled tasks, background-task notifications, other plugins) arriving during a pause are **dropped**, not queued, so a completion notice that lands while paused is lost. Your own prompts are never held, and sending one cancels the pause.
+- Resume slots across several sessions are claimed through a shared store without an atomic reservation, so two sessions waking in the same instant can still land close together; the 20-second spacing is best effort.
+- A session with no UI attached never pauses, and a pause restored into one does not block tools; it resumes when a UI attaches.
 
 ## Develop
 

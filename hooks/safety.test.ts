@@ -34,7 +34,7 @@ function engine(on: any, opts: { sessionId?: boolean; surfaces?: string[]; perce
 
 test('a mod that cannot load its state lets prompts through', async ($, on) => {
   engine(on, { sessionId: false }) // $.session.id() has no implementation, so loading throws
-  const r: any = await $.prompt.submit({ text: 'hello there world' } as any)
+  const r: any = await $.prompt.submit({ text: 'hello there world', wait: false, origin: { kind: 'composer' } } as any)
   expect(r.text).toBe('hello there world')
   expect(r.drop).toBe(undefined)
 })

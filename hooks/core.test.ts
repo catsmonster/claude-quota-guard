@@ -153,7 +153,7 @@ test('restart while paused: boot restores and resumes once the time has passed',
   expect(r.state.rec.phase).toBe('resuming')
 })
 
-test('manual prompt while paused cancels auto-resume; non-user prompts are held', () => {
+test('a manual prompt while paused cancels auto-resume (holding automatic prompts is the adapter, see adversarial-review.test.ts)', () => {
   const p = pausedState()
   const r = run(p, { type: 'userPrompt', now: T0 + MIN, text: 'continue please, I am back', isUser: true })
   expect(r.state.rec.phase).toBe('idle')

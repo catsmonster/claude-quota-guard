@@ -220,7 +220,8 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     }
     for (const k of Object.keys(r)) delete (r as Record<string, unknown>)[k]
     Object.assign(r, fresh)
-    const top = wins[0]
+    // the worst breached window drives the message and the decision to abort a running turn
+    const top = wins.reduce<Win | undefined>((m, w) => (m === undefined || w.percent > m.percent ? w : m), undefined)
     if (top) {
       const pct = Math.round(top.percent)
       toast(
@@ -280,9 +281,13 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       if (r.delayCount === 1) toast('Usage data unavailable; will retry shortly.')
       return
     }
+    // every managed window counts, not only the ones that caused the pause: another one may have
+    // been exhausted since (or the pause started on a different window)
     const limited: number[] = []
     let stale = false
-    for (const k of r.kinds) {
+    const kinds = new Set(r.kinds.filter(k => limitFor(k, cfg) !== undefined))
+    for (const w of usage.windows) if (limitFor(w.kind, cfg) !== undefined) kinds.add(w.kind)
+    for (const k of kinds) {
       const w = usage.windows.find(x => x.kind === k)
       const lim = limitFor(k, cfg) ?? cfg.threshold
       if (!w) {
@@ -290,6 +295,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
         continue
       }
       if (w.percent >= lim) {
+        if (!r.kinds.includes(k)) r.kinds.push(k)
         if (w.resetsAt !== undefined && w.resetsAt > now) limited.push(w.resetsAt)
         else stale = true // reading predates the reset; only a fresh response can tell
       }
@@ -312,7 +318,9 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
 
   const tickLike = (now: number, usage: Usage | null) => {
     if (r.phase === 'paused' && r.wakeAt !== undefined && now >= r.wakeAt) wake(now, usage)
-    else if (r.phase === 'resuming' && r.lastResumeAt !== undefined && now - r.lastResumeAt > RESUME_WATCHDOG_MS) {
+    // a turn that is running is the resume prompt being answered, however slowly: never time it out
+    // (and never queue a second probe behind it); only a prompt that never started is a failure
+    else if (r.phase === 'resuming' && !s.busy && r.lastResumeAt !== undefined && now - r.lastResumeAt > RESUME_WATCHDOG_MS) {
       resumeFailed(now, 'no response to the resume prompt')
     }
   }
@@ -329,9 +337,12 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       const u = ev.usage
       const five = u.windows.find(w => w.kind === FIVE)
       if (five) {
-        const sameWindow = s.last && Math.abs((s.last.resetsAt ?? 0) - (five.resetsAt ?? 0)) < 120_000
-        if (sameWindow && s.last && five.percent > s.last.pct) {
-          s.deltas.push(five.percent - s.last.pct)
+        // burn-rate history is the growth over the last few measurements of THIS window: a new
+        // window starts it over, and flat measurements age an old spike out
+        const sameWindow = s.last !== undefined && Math.abs((s.last.resetsAt ?? 0) - (five.resetsAt ?? 0)) < 120_000
+        if (!sameWindow) s.deltas = []
+        else if (s.last) {
+          s.deltas.push(Math.max(0, five.percent - s.last.pct))
           s.deltas = s.deltas.slice(-5)
         }
         s.last = { pct: five.percent, resetsAt: five.resetsAt }
@@ -339,11 +350,35 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       const hit = breaches(u, s, cfg)
 
       if (r.phase === 'resuming') {
-        const still = u.windows.filter(w => r.kinds.includes(w.kind) && w.percent >= (limitFor(w.kind, cfg) ?? cfg.threshold) && (w.resetsAt ?? Infinity) > ev.now)
-        if (still.length) {
-          const next = Math.max(...still.map(w => w.resetsAt ?? ev.now))
-          resumeFailed(ev.now, 'quota still exhausted', Number.isFinite(next) ? next : undefined)
-        } else {
+        // Only a reading that is evidence counts. Below the limit: the reset happened. At or over it
+        // with a reset still ahead: it did not. At or over it with a reset time already past, or a
+        // window missing, is the old reading again (a context-only measurement, an errored turn):
+        // no evidence either way, so keep waiting for the turn's own outcome.
+        const managed = r.kinds.filter(k => limitFor(k, cfg) !== undefined)
+        const limitedResets: number[] = []
+        let allLow = managed.length > 0
+        for (const k of managed) {
+          const w = u.windows.find(x => x.kind === k)
+          const lim = limitFor(k, cfg) ?? cfg.threshold
+          if (!w) {
+            allLow = false
+            continue
+          }
+          if (w.percent >= lim) {
+            allLow = false
+            if (w.resetsAt !== undefined && w.resetsAt > ev.now) limitedResets.push(w.resetsAt)
+          }
+        }
+        // a window that was fine when the pause began but is exhausted now blocks the resume too
+        for (const w of hit) {
+          if (r.kinds.includes(w.kind) || w.resetsAt === undefined || w.resetsAt <= ev.now) continue
+          r.kinds.push(w.kind)
+          limitedResets.push(w.resetsAt)
+          allLow = false
+        }
+        if (limitedResets.length) {
+          resumeFailed(ev.now, 'quota still exhausted', Math.max(...limitedResets))
+        } else if (allLow) {
           const task = r.task
           settle(task)
           toast('Quota reset verified.')
@@ -369,6 +404,11 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       }
       if (r.phase === 'armed') {
         r.usage = u.windows.map(w => ({ ...w }))
+        // a window that is exhausted after arming joins the pause and sets how long it lasts
+        for (const w of hit) {
+          if (!r.kinds.includes(w.kind)) r.kinds.push(w.kind)
+          if (w.resetsAt !== undefined) r.expectedReset = Math.max(r.expectedReset ?? 0, w.resetsAt)
+        }
         const worst = hit.reduce((m, w) => Math.max(m, w.percent), 0)
         if (s.busy && !r.abortRequested && worst >= cfg.abortThreshold) {
           r.abortRequested = true
@@ -376,15 +416,28 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
         }
         break
       }
-      if (r.phase === 'paused' || r.phase === 'stopped') {
-        const resets = u.windows.filter(w => r.kinds.includes(w.kind) && w.resetsAt !== undefined && w.resetsAt > ev.now).map(w => w.resetsAt as number)
-        if (r.phase === 'paused' && resets.length) {
-          const next = Math.max(...resets)
+      if (r.phase === 'paused') {
+        for (const w of hit) if (!r.kinds.includes(w.kind)) r.kinds.push(w.kind)
+        const managed = r.kinds.filter(k => limitFor(k, cfg) !== undefined)
+        const blocking: number[] = []
+        let allLow = managed.length > 0
+        for (const k of managed) {
+          const w = u.windows.find(x => x.kind === k)
+          const lim = limitFor(k, cfg) ?? cfg.threshold
+          if (!w || w.percent >= lim) allLow = false
+          if (w && w.percent >= lim && w.resetsAt !== undefined && w.resetsAt > ev.now) blocking.push(w.resetsAt)
+        }
+        if (blocking.length) {
+          // only a reading that is still over the limit can move the wake time
+          const next = Math.max(...blocking)
           if (r.expectedReset === undefined || Math.abs(next - r.expectedReset) > 60_000) {
             r.expectedReset = next
             r.wakeAt = next + cfg.graceSec * 1000
             toast(`Reset time changed; now paused until approximately ${fmtClock(r.wakeAt)}.`)
           }
+        } else if (allLow && r.wakeAt !== undefined && r.wakeAt > ev.now) {
+          // a fresh reading under the limit means the reset already happened: wake at the next check
+          r.wakeAt = ev.now
         }
       }
       break
