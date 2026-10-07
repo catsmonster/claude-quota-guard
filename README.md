@@ -29,7 +29,7 @@ Add `CLAUDE_CODE_PLUGIN_DIRS` to the `env` block of your **user** settings file,
 
 - Use an absolute path. Forward slashes work on Windows. For several folders, separate them with `;` on Windows (`:` on macOS/Linux).
 - The variable is read **only** from the process environment or the `env` block of the user settings file. It is **never** read from project settings (`.claude/settings.json` or `.claude/settings.local.json` in a repo); putting it there does nothing.
-- The folder is loaded in place, so it runs the working copy of the repo: `git pull` to update. Interactive sessions reload it when a file is saved.
+- The folder is loaded in place, so it runs the working copy of the repo: `git pull` to update. A terminal session reloads it when a file is saved. The Desktop Code tab does **not** watch the folder unless you also set `CLAUDE_CODE_PLUGIN_DIR_WATCH` to `1` in the same `env` block; without it, restart the session after updating the mod.
 - Sessions that are already open keep what they started with. The Desktop app picks the change up in **new** sessions, or after you restart the app. If `CLAUDE_CODE_PLUGIN_DIRS` is already set in the environment a session is launched with, that value wins over the settings file.
 
 ### One terminal session
