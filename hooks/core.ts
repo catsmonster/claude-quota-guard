@@ -150,7 +150,7 @@ function breaches(u: Usage, s: State, cfg: Config): Win[] {
   return out
 }
 
-const backoffMs = (n: number) => BACKOFF_SEC[Math.min(n, BACKOFF_SEC.length - 1)] * 1000
+const backoffMs = (n: number) => (BACKOFF_SEC[Math.min(n, BACKOFF_SEC.length - 1)] ?? 900) * 1000
 
 export function blocksAutomation(s: State): boolean {
   return s.rec.phase === 'paused' || s.rec.phase === 'stopped' || s.rec.phase === 'compacting'

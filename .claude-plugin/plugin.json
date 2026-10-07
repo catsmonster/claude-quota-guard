@@ -78,5 +78,8 @@
       "max": 100
     }
   },
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "catsmonster"
+  }
 }

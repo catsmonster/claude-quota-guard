@@ -57,14 +57,14 @@ function buildDetail(b: any, api: any): CtxDetail {
 
 // one distinct colour per category, assigned by size rank so the bar and the list always agree
 const PALETTE = ['green', 'cyan', 'yellow', 'magenta', 'red', 'blue', 'white']
-const colorAt = (rank: number) => PALETTE[rank % PALETTE.length]
+const colorAt = (rank: number) => PALETTE[rank % PALETTE.length] ?? 'white'
 // Continuous bar: each segment is as wide as its share of the whole window, so the
 // filled part is always exactly the context percentage. Segments are sized in cells
 // (fractions allowed; the engine refuses fractional percentages).
 // Remote surfaces (desktop, editor, mobile) can draw vectors: a rounded pill with a soft
 // track, segments clipped to it, and a hairline where compaction starts to apply.
 const HEX = ['#3fb950', '#22b8cf', '#e3b341', '#c678dd', '#f0626b', '#5b8def', '#adb5bd']
-const hexAt = (rank: number) => HEX[rank % HEX.length]
+const hexAt = (rank: number) => HEX[rank % HEX.length] ?? '#adb5bd'
 
 function ctxPill(Svg: any, segs: { pct: number; hex: string }[], w: number, bh: number, tickPct?: number) {
   const pad = 2
@@ -129,17 +129,22 @@ let turnId: string | undefined
 let timer: { cancel: () => void } | undefined
 let loading: Promise<void> | undefined
 let lastText = ''
+let warned = false
+let booted = false
+const STAGGER_MS = 20_000
+const MAX_STAGGER_MS = 120_000
 
 let commandReady = false
 async function registerCommand($: any) {
   if (commandReady) return
+  const spec = {
+    description: 'Quota guard: status, on/off, threshold, pause, cancel, resume, test',
+    argumentHint: '[status|on|off|threshold N|weekly N|ctxmin N|ctx [close]|pause [min]|cancel|resume|test on|off|sim ...]',
+    immediate: true as const,
+  }
   try {
-    await $.command.register({
-      name: 'quota',
-      description: 'Quota guard: status, on/off, threshold, pause, cancel, resume, test',
-      argumentHint: '[status|on|off|threshold N|weekly N|ctxmin N|ctx [close]|pause [min]|cancel|resume|test on|off|sim ...]',
-      immediate: true,
-    })
+    await $.command.register({ name: 'quota', ...spec })
+    await $.command.register({ name: 'quota-guard', ...spec })
     commandReady = true
   } catch (err) {
     $.ui.log(PREFIX + `could not register /quota: ${String(err)}`)
@@ -176,6 +181,54 @@ async function load($: any): Promise<void> {
   if (typeof lg === 'boolean') legend = lg
   sim = ((await $.store.get('sim')) as Sim | undefined) ?? null
 }
+
+// A failure in this mod must never stop prompts or tool calls: hooks catch, log once, and pass through.
+function logOnce($: any, err: unknown) {
+  if (warned) return
+  warned = true
+  try {
+    $.ui.log(PREFIX + `internal error, passing through: ${String(err)}`)
+  } catch {
+    /* nothing more to do */
+  }
+}
+
+async function usable($: any): Promise<boolean> {
+  try {
+    await ensure($)
+    return true
+  } catch (err) {
+    logOnce($, err)
+    return false
+  }
+}
+
+// Headless runs (claude -p, an SDK host with no UI) have no surface attached: never pause those,
+// nobody would be there to resume them. Fails open to "watched" when the engine cannot say.
+async function watched($: any): Promise<boolean> {
+  try {
+    return (await $.session.surfaces()).length > 0
+  } catch {
+    return true
+  }
+}
+
+// Every open session shares the same account windows, so they all pause and wake together.
+// Resume prompts are staggered through the shared store so they do not land in one burst.
+async function claimSlot($: any) {
+  try {
+    const now = await $.clock.now()
+    const last = Number(await $.store.get('lastResume')) || 0
+    let h = 0
+    for (const ch of sid) h = (h * 31 + ch.charCodeAt(0)) % 10
+    const at = Math.min(Math.max(now + h * 1000, last + STAGGER_MS), now + MAX_STAGGER_MS)
+    await $.store.set('lastResume', at)
+    if (at > now) await $.clock.sleep(at - now)
+  } catch {
+    /* staggering is best effort */
+  }
+}
+
 
 function ensure($: any): Promise<void> {
   if (!commandReady) void registerCommand($)
@@ -296,13 +349,14 @@ async function publish($: any, usage: Usage | null, now: number) {
 
 async function dispatch($: any, ev: Ev): Promise<void> {
   await ensure($)
+  if ((ev.type === 'measure' || ev.type === 'tick' || ev.type === 'forcePause') && !(await watched($))) return
   const { state, fx } = step(S as State, ev, cfg)
   S = state
   await persist($)
   sync($)
   for (const f of fx) if (f.t === 'toast') say($, f.text)
   const rest = fx.filter(f => f.t !== 'toast')
-  if (rest.length) void runEffects($, rest)
+  if (rest.length) void runEffects($, rest).catch((err: unknown) => logOnce($, err))
 }
 
 function say($: any, text: string) {
@@ -313,7 +367,7 @@ function say($: any, text: string) {
 
 function sync($: any) {
   if (needsHeartbeat(S as State)) {
-    timer ??= $.clock.every(HEARTBEAT_MS, () => void tick($))
+    timer ??= $.clock.every(HEARTBEAT_MS, () => void tick($).catch((err: unknown) => logOnce($, err)))
   } else if (timer) {
     timer.cancel()
     timer = undefined
@@ -371,9 +425,10 @@ async function doCompact($: any, instructions: string) {
 async function doSubmit($: any, text: string) {
   if (testMode && dryActions) {
     $.ui.log(PREFIX + `[dry-run] would submit: ${text.split('\n')[0]}`)
-    $.clock.after(1500, () => void syntheticMeasure($))
+    $.clock.after(1500, () => void syntheticMeasure($).catch((err: unknown) => logOnce($, err)))
     return
   }
+  await claimSlot($)
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const r = await $.prompt.submit({ text })
@@ -395,6 +450,8 @@ async function syntheticMeasure($: any) {
 
 async function boot($: any) {
   await ensure($)
+  if (booted || !(await watched($))) return
+  booted = true
   const now = await $.clock.now()
   const usage = await readUsage($)
   await dispatch($, { type: 'boot', now, usage })
@@ -455,6 +512,7 @@ case 'ctx': {
       timer = undefined
       S = null
       loading = undefined
+      booted = false
       turnId = undefined
       await boot($)
       return 'Simulated restart: in-memory state dropped and reloaded from the store.'
@@ -537,33 +595,61 @@ return startSim($, a ?? '', b)
   }
 }
 
+async function runQuota($: any, e: { args: string }) {
+  if (!(await usable($))) return { text: PREFIX + 'not available (could not load saved state).' }
+  return { text: await command($, e.args.trim()) }
+}
+
 export const register: Register = (on, opts) => {
   options = opts
 
-  // ---------- hooks ----------
+  // ---------- hooks (every one fails open) ----------
 
   on('session.start', async ($, e, next) => {
-    await registerCommand($)
-    await boot($)
-    void $.ui.open({ id: PANE, title: 'Context' })
+    try {
+      await registerCommand($)
+      await boot($)
+      void $.ui.open({ id: PANE, title: 'Context' })
+    } catch (err) {
+      logOnce($, err)
+    }
+    return next(e)
+  })
+
+  // a UI attaching after start (Desktop attaches late): run the startup check then
+  on('session.attach', async ($, e, next) => {
+    try {
+      await boot($)
+    } catch (err) {
+      logOnce($, err)
+    }
     return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
-    await ensure($)
-    const now = await $.clock.now()
-    const usage = testMode ? await readUsage($) : mapUsage(e)
-    if (usage && usage.windows.length) {
-      await dispatch($, { type: 'measure', now, usage })
-      $.ui.status(statusLine(S as State, usage, now))
-      await publish($, usage, now)
+    if (await usable($)) {
+      try {
+        const now = await $.clock.now()
+        const usage = testMode ? await readUsage($) : mapUsage(e)
+        if (usage && usage.windows.length) {
+          await dispatch($, { type: 'measure', now, usage })
+          $.ui.status(statusLine(S as State, usage, now))
+          await publish($, usage, now)
+        }
+      } catch (err) {
+        logOnce($, err)
+      }
     }
     return next(e)
   })
 
   on('turn.start', async ($, e, next) => {
     turnId = e.turnId
-    await dispatch($, { type: 'turnStart' })
+    try {
+      await dispatch($, { type: 'turnStart' })
+    } catch (err) {
+      logOnce($, err)
+    }
     return next(e)
   })
 
@@ -571,46 +657,59 @@ export const register: Register = (on, opts) => {
     const r = await next(e)
     if (e.agentId === undefined) {
       turnId = undefined
-      // detached: this hook must return before a compaction can run
-      void dispatch($, { type: 'turnComplete', now: await $.clock.now(), reason: e.reason })
-    }
-    return r
-  })
-
-  on('prompt.submit', async ($, e, next) => {
-    await ensure($)
-    if (e.origin.kind === 'plugin') return next(e)
-    const isUser = USER_KINDS.includes(e.origin.kind)
-    if (!isUser && cfg.enabled && blocksAutomation(S as State)) {
-      return { drop: PREFIX + 'paused for a usage limit; automatic prompts are held.' }
-    }
-    lastText = e.text
-    await dispatch($, { type: 'userPrompt', now: await $.clock.now(), text: e.text, isUser })
-    return next(e)
-  })
-
-  on('session.compact', async ($, e, next) => {
-    const r = await next(e)
-    if (e.trigger !== 'precompute' && r && r.skip === undefined) {
-      await ensure($)
-      // our own compaction is reported by doCompact; this catches everyone else's
-      if ((S as State).rec.phase !== 'compacting') {
-        await dispatch($, { type: 'compactDone', now: await $.clock.now(), ok: true, external: true })
+      try {
+        // detached: this hook must return before a compaction can run
+        void dispatch($, { type: 'turnComplete', now: await $.clock.now(), reason: e.reason }).catch((err: unknown) => logOnce($, err))
+      } catch (err) {
+        logOnce($, err)
       }
     }
     return r
   })
 
-  on('tool.call', async ($, e, next) => {
-    await ensure($)
-    if (cfg.enabled && (S as State).rec.phase === 'paused') {
-      return { deny: PREFIX + 'paused until the usage limit resets.' }
+  on('prompt.submit', async ($, e, next) => {
+    if (e.origin.kind === 'plugin' || !(await usable($))) return next(e)
+    try {
+      const isUser = USER_KINDS.includes(e.origin.kind)
+      if (!isUser && cfg.enabled && blocksAutomation(S as State)) {
+        return { drop: PREFIX + 'paused for a usage limit; automatic prompts are held.' }
+      }
+      lastText = e.text
+      await dispatch($, { type: 'userPrompt', now: await $.clock.now(), text: e.text, isUser })
+    } catch (err) {
+      logOnce($, err)
     }
     return next(e)
-  })
+  }).catch(($, e, next) => next(e))
+
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      if (e.trigger !== 'precompute' && r && r.skip === undefined && (await usable($))) {
+        // our own compaction is reported by doCompact; this catches everyone else's
+        if ((S as State).rec.phase !== 'compacting') {
+          await dispatch($, { type: 'compactDone', now: await $.clock.now(), ok: true, external: true })
+        }
+      }
+    } catch (err) {
+      logOnce($, err)
+    }
+    return r
+  }).catch(($, e, next) => next(e))
+
+  on('tool.call', async ($, e, next) => {
+    try {
+      if ((await usable($)) && cfg.enabled && (S as State).rec.phase === 'paused') {
+        return { deny: PREFIX + 'paused until the usage limit resets.' }
+      }
+    } catch (err) {
+      logOnce($, err)
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    await ensure($)
+    if (!(await usable($))) return next(e)
     if (e.props.hasSurvey) return next(e)
     const v = await read($, bar)
     const { Box, Text } = $.ui.resolve(e)
@@ -661,7 +760,7 @@ export const register: Register = (on, opts) => {
         <Box gap={1} flexShrink={0}>
           <T dimColor>ctx</T>
           {Svg
-            ? ctxPill(Svg, segs.map((sg, i) => ({ pct: sg.pct, hex: parts.length ? hexAt(i) : sg.color === 'red' ? HEX[4] : sg.color === 'yellow' ? HEX[2] : HEX[0] })), tier === 'min' ? 70 : tier === 'mid' ? 110 : 150, 8, v.ctxMin)
+            ? ctxPill(Svg, segs.map((sg, i) => ({ pct: sg.pct, hex: parts.length ? hexAt(i) : sg.color === 'red' ? hexAt(4) : sg.color === 'yellow' ? hexAt(2) : hexAt(0) })), tier === 'min' ? 70 : tier === 'mid' ? 110 : 150, 8, v.ctxMin)
             : ctxBar(Box, segs, tier === 'min' ? 8 : tier === 'mid' ? 14 : 20)}
           <T bold>{Math.round(v.ctx)}%</T>
         </Box>
@@ -683,7 +782,8 @@ export const register: Register = (on, opts) => {
     )
   })
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    if (!(await usable($))) return next(e)
     const d = await read($, detail)
     const { Box, Text } = $.ui.resolve(e)
     const Svg = (e.surface !== 'terminal' ? ($.ui.resolve(e) as any).Svg : undefined) as any
@@ -772,8 +872,6 @@ export const register: Register = (on, opts) => {
     return next(e)
   })
 
-  on('command.run', { command: 'quota' }, async ($, e) => {
-    await ensure($)
-    return { text: await command($, e.args.trim()) }
-  })
+  on('command.run', { command: 'quota' }, runQuota).catch(() => ({ text: PREFIX + 'internal error; see the debug log.' }))
+  on('command.run', { command: 'quota-guard' }, runQuota).catch(() => ({ text: PREFIX + 'internal error; see the debug log.' }))
 }
