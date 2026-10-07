@@ -17,6 +17,8 @@ import {
   step,
 } from './core'
 import type { Config, Ev, Fx, State, Usage, Win } from './core'
+import { IDLE_DEFAULTS, clearOnNotification, freshPending, idleInstructions, pendingFromTool, planIdleCompact } from './idle'
+import type { IdleCfg, Pending } from './idle'
 
 const HEARTBEAT_MS = 30_000
 const USER_KINDS = ['composer', 'bridge', 'sdk', 'slack-ping']
@@ -123,7 +125,7 @@ type Sim = {
   ctx?: number
 }
 
-type Overrides = Partial<Config> & { testMode?: boolean; dryActions?: boolean; legend?: boolean }
+type Overrides = Partial<Config> & { testMode?: boolean; dryActions?: boolean; legend?: boolean; idle?: Partial<IdleCfg> }
 
 let S: State | null = null
 let cfg: Config = { ...DEFAULTS }
@@ -136,6 +138,12 @@ let turnId: string | undefined
 let timer: { cancel: () => void } | undefined
 let loading: Promise<void> | undefined
 let lastText = ''
+let idleCfg: IdleCfg = { ...IDLE_DEFAULTS }
+let waiting: Pending[] = [] // background work the session is currently waiting on
+let lastResponseAt: number | undefined
+let lastIdleCompactAt: number | undefined
+let idleTimer: { cancel: () => void } | undefined
+let idleStats: { at: number; before: number; count: number } | undefined
 let warned = false
 let booted = false
 const STAGGER_MS = 20_000
@@ -146,7 +154,7 @@ async function registerCommand($: any) {
   if (commandReady) return
   const spec = {
     description: 'Quota guard: status, on/off, threshold, pause, cancel, resume, test',
-    argumentHint: '[status|on|off|threshold N|weekly N|ctxmin N|ctx [close]|pause [min]|cancel|resume|test on|off|sim ...]',
+    argumentHint: '[status|on|off|threshold N|weekly N|ctxmin N|idle [on|off|any|waiting|min N|ttl M]|ctx [close]|pause [min]|cancel|resume|test on|off|sim ...]',
     immediate: true as const,
   }
   try {
@@ -181,7 +189,16 @@ async function load($: any): Promise<void> {
     compactMinContext: num('compactMinContext', DEFAULTS.compactMinContext),
   }
   testMode = typeof options.testMode === 'boolean' ? options.testMode : false
-  const { testMode: tm, dryActions: da, legend: lg, ...rest } = o
+  idleCfg = {
+    enabled: typeof options.idleCompact === 'boolean' ? options.idleCompact : IDLE_DEFAULTS.enabled,
+    minTokens: num('idleCompactMinTokens', IDLE_DEFAULTS.minTokens),
+    ttlMs: num('cacheTtlMinutes', IDLE_DEFAULTS.ttlMs / 60_000) * 60_000,
+    marginMs: num('idleMarginSeconds', IDLE_DEFAULTS.marginMs / 1000) * 1000,
+    requireWaiting: typeof options.idleRequiresBackground === 'boolean' ? options.idleRequiresBackground : IDLE_DEFAULTS.requireWaiting,
+    ...(o.idle ?? {}),
+  }
+  idleStats = ((await $.store.get('idle:' + sid)) as typeof idleStats) ?? undefined
+  const { testMode: tm, dryActions: da, legend: lg, idle: _idle, ...rest } = o
   cfg = { ...cfg, ...rest }
   if (typeof tm === 'boolean') testMode = tm
   if (typeof da === 'boolean') dryActions = da
@@ -249,7 +266,7 @@ function ensure($: any): Promise<void> {
 
 const persist = ($: any) => $.store.set('state:' + sid, S).catch(() => {})
 const saveCfg = ($: any) =>
-  $.store.set('cfg', { ...cfg, testMode, dryActions, legend }).catch(() => {})
+  $.store.set('cfg', { ...cfg, testMode, dryActions, legend, idle: idleCfg }).catch(() => {})
 const saveSim = ($: any) => $.store.set('sim', sim).catch(() => {})
 
 // ---------- usage ----------
@@ -468,6 +485,82 @@ async function boot($: any) {
 
 // ---------- /quota ----------
 
+function parseTokens(raw: string | undefined): number | undefined {
+  const m = /^(\d+(?:\.\d+)?)\s*(k|m)?$/i.exec((raw ?? '').trim())
+  if (!m) return undefined
+  const n = Number(m[1]) * (m[2]?.toLowerCase() === 'm' ? 1_000_000 : m[2]?.toLowerCase() === 'k' ? 1000 : 1)
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : undefined
+}
+
+async function contextTokens($: any): Promise<number | undefined> {
+  try {
+    return (await $.session.usage()).context?.tokens
+  } catch {
+    return undefined
+  }
+}
+
+// Idle compaction: while the session waits on background work, compact shortly before the prompt
+// cache expires so the next request does not re-send a huge context at full price. Silent by design.
+async function scheduleIdle($: any) {
+  idleTimer?.cancel()
+  idleTimer = undefined
+  if (!idleCfg.enabled || lastResponseAt === undefined) return
+  const now = await $.clock.now()
+  const plan = planIdleCompact(idleCfg, {
+    now,
+    lastResponseAt,
+    tokens: await contextTokens($),
+    busy: (S as State).busy,
+    pending: waiting,
+    quotaPhase: (S as State).rec.phase,
+    lastIdleCompactAt,
+  })
+  if (plan.act) void runIdle($).catch((err: unknown) => logOnce($, err))
+  else if (plan.at !== undefined) {
+    idleTimer = $.clock.after(Math.max(1000, plan.at - now), () => void runIdle($).catch((err: unknown) => logOnce($, err)))
+  }
+}
+
+async function runIdle($: any) {
+  idleTimer = undefined
+  await ensure($)
+  const now = await $.clock.now()
+  const tokens = await contextTokens($)
+  const plan = planIdleCompact(idleCfg, {
+    now,
+    lastResponseAt,
+    tokens,
+    busy: (S as State).busy,
+    pending: waiting,
+    quotaPhase: (S as State).rec.phase,
+    lastIdleCompactAt,
+  })
+  if (!plan.act) {
+    if (plan.at !== undefined) await scheduleIdle($)
+    return
+  }
+  lastIdleCompactAt = now // once per response, whatever happens next
+  try {
+    const r = await $.session.compact({ instructions: idleInstructions(freshPending(waiting, now), (S as State).rec.task) })
+    if (r && r.skip === undefined) {
+      idleStats = { at: now, before: tokens ?? 0, count: (idleStats?.count ?? 0) + 1 }
+      await $.store.set('idle:' + sid, idleStats)
+    }
+  } catch {
+    /* refused while a turn runs, or the engine vetoed it: nothing to do, the next response re-arms */
+  }
+}
+
+function idleLine(now: number): string {
+  const c = idleCfg
+  const n = freshPending(waiting, now).length
+  const bits = [`Idle compaction: ${c.enabled ? 'ON' : 'OFF'} (${c.requireWaiting ? 'only while waiting on background work' : 'any idle session'}, above ${Math.round(c.minTokens / 1000)}k tokens, cache ${Math.round(c.ttlMs / 60_000)}m, ${Math.round(c.marginMs / 1000)}s early)`]
+  bits.push(n ? `waiting on ${n} background task${n > 1 ? 's' : ''}` : 'not waiting on anything')
+  if (idleStats) bits.push(`last at ${fmtClock(idleStats.at)} from ${Math.round(idleStats.before / 1000)}k tokens (${idleStats.count} total)`)
+  return bits.join('; ')
+}
+
 async function describe($: any): Promise<string> {
   const now = await $.clock.now()
   const usage = await readUsage($)
@@ -486,6 +579,7 @@ async function describe($: any): Promise<string> {
   lines.push(`State: ${r.phase.toUpperCase()}${r.reason ? ` - ${r.reason}` : ''}`)
   if (r.phase === 'paused' && r.wakeAt) lines.push(`Paused until approximately ${fmtClock(r.wakeAt)} (in ${fmtDur(r.wakeAt - now)}); resume attempts used: ${r.resumeAttempts}/${cfg.maxResumeAttempts}`)
   if (r.compactedAt) lines.push(`Compacted at ${fmtClock(r.compactedAt)}${r.compactFailed ? ' (failed)' : ''}`)
+  lines.push(idleLine(now))
   if (r.task) lines.push(`Task on record: ${r.task.slice(0, 160)}${r.task.length > 160 ? '...' : ''}`)
   return lines.join('\n')
 }
@@ -587,6 +681,26 @@ async function command($: any, args: string): Promise<string> {
       await publish($, await readUsage($), now)
       await $.ui.open({ id: PANE, title: 'Context' })
       return 'Context pane opened (each category has its own colour, largest first).'
+    case 'idle': {
+      if (a === 'on' || a === 'off') idleCfg = { ...idleCfg, enabled: a === 'on' }
+      else if (a === 'any' || a === 'waiting') idleCfg = { ...idleCfg, requireWaiting: a === 'waiting' }
+      else if (a === 'min') {
+        const n = parseTokens(b)
+        if (n === undefined) return 'Usage: /quota idle min <tokens>  (for example 200k)'
+        idleCfg = { ...idleCfg, minTokens: n }
+      } else if (a === 'ttl') {
+        const m = Number(b)
+        if (!Number.isFinite(m) || m < 1 || m > 120) return 'Usage: /quota idle ttl <minutes 1-120>  (5 or 60 are the cache lifetimes)'
+        idleCfg = { ...idleCfg, ttlMs: m * 60_000 }
+      } else if (a === 'margin') {
+        const sec = Number(b)
+        if (!Number.isFinite(sec) || sec < 0 || sec > 1800) return 'Usage: /quota idle margin <seconds 0-1800>'
+        idleCfg = { ...idleCfg, marginMs: sec * 1000 }
+      } else if (a !== undefined && a !== '' && a !== 'status') return 'Usage: /quota idle [on|off|any|waiting|min N|ttl M|margin S]'
+      await saveCfg($)
+      await scheduleIdle($)
+      return idleLine(now)
+    }
     case 'ctxmin': {
       const n = Number(a)
       if (!Number.isFinite(n) || n < 0 || n > 100) return 'Usage: /quota ctxmin <0-100>'
@@ -652,6 +766,8 @@ export const register: Register = (on, opts) => {
 
   on('turn.start', async ($, e, next) => {
     turnId = e.turnId
+    idleTimer?.cancel()
+    idleTimer = undefined
     try {
       await dispatch($, { type: 'turnStart' })
     } catch (err) {
@@ -666,7 +782,11 @@ export const register: Register = (on, opts) => {
       turnId = undefined
       try {
         // detached: this hook must return before a compaction can run
-        void dispatch($, { type: 'turnComplete', now: await $.clock.now(), reason: e.reason }).catch((err: unknown) => logOnce($, err))
+        const at = await $.clock.now()
+        lastResponseAt = at
+        void dispatch($, { type: 'turnComplete', now: at, reason: e.reason })
+          .then(() => scheduleIdle($))
+          .catch((err: unknown) => logOnce($, err))
       } catch (err) {
         logOnce($, err)
       }
@@ -677,6 +797,9 @@ export const register: Register = (on, opts) => {
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind === 'plugin' || !(await usable($))) return next(e)
     try {
+      idleTimer?.cancel()
+      idleTimer = undefined
+      if (e.origin.kind === 'task-notification') waiting = clearOnNotification(waiting, e.text)
       const isUser = USER_KINDS.includes(e.origin.kind)
       if (!isUser && cfg.enabled && blocksAutomation(S as State)) {
         return { drop: PREFIX + 'paused for a usage limit; automatic prompts are held.' }
@@ -708,6 +831,10 @@ export const register: Register = (on, opts) => {
     try {
       if ((await usable($)) && cfg.enabled && (S as State).rec.phase === 'paused') {
         return { deny: PREFIX + 'paused until the usage limit resets.' }
+      }
+      if (e.agentId === undefined) {
+        const w = pendingFromTool(e.tool, e as unknown as Record<string, unknown>, String(e.tool_use_id ?? ''), await $.clock.now())
+        if (w) waiting = [...freshPending(waiting, w.at), w].slice(-20)
       }
     } catch (err) {
       logOnce($, err)
@@ -876,6 +1003,8 @@ export const register: Register = (on, opts) => {
   on('session.end', ($, e, next) => {
     timer?.cancel()
     timer = undefined
+    idleTimer?.cancel()
+    idleTimer = undefined
     return next(e)
   })
 

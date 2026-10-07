@@ -76,6 +76,42 @@
       "default": 30,
       "min": 0,
       "max": 100
+    },
+    "idleCompact": {
+      "type": "boolean",
+      "title": "Idle compaction",
+      "description": "While waiting on background work, compact shortly before the prompt cache expires to avoid re-sending a large context at full price.",
+      "default": true
+    },
+    "idleCompactMinTokens": {
+      "type": "number",
+      "title": "Idle compaction minimum (tokens)",
+      "description": "Only compact while idle when the context is at least this many tokens.",
+      "default": 200000,
+      "min": 20000,
+      "max": 1000000
+    },
+    "cacheTtlMinutes": {
+      "type": "number",
+      "title": "Prompt-cache lifetime (minutes)",
+      "description": "60 for the 1-hour cache, 5 for the 5-minute cache.",
+      "default": 60,
+      "min": 1,
+      "max": 120
+    },
+    "idleMarginSeconds": {
+      "type": "number",
+      "title": "Compact this early (seconds)",
+      "description": "How long before the cache would expire to compact.",
+      "default": 180,
+      "min": 0,
+      "max": 1800
+    },
+    "idleRequiresBackground": {
+      "type": "boolean",
+      "title": "Idle compaction only while waiting on background work",
+      "description": "Off (default): compact any idle session shortly before the prompt cache expires. On: only when a background command, monitor or agent is pending.",
+      "default": false
     }
   },
   "types": "./types/index.d.ts",

@@ -6,6 +6,7 @@ A [Claude Code](https://claude.com/claude-code) mod (plugin of function hooks) t
 - at a threshold (default **94%**, lowered automatically when recent turns jump a lot) it finishes the current turn, then **compacts** (only if context is above 30%) and **pauses**
 - waits until the reported reset time, re-checks, and **resumes the task automatically**
 - survives restarts and reloads: pause state is persisted, and a 30-second heartbeat compares the wall clock, so sleep or a late timer only delays the resume
+- **idle compaction**: when a session sits idle (or waits on a background command), it compacts shortly before the prompt cache expires, so the next request does not re-send a huge context at full price
 - shows a usage bar above the prompt (5h, 7d, context breakdown) and a full context pane on wide windows
 
 > Early-access API: written against Claude Code 2.1.289+ Mods (`claude-code` hooks API). It may need updates as that API changes.
@@ -71,7 +72,19 @@ This also auto-loads, but it is a **copy**: it does not follow the repo, so it d
 | `/quota pause [min]` | force a pause (compacts per the context rule) for testing |
 | `/quota cancel` | cancel the pending auto-resume (holds until you act) |
 | `/quota resume` | resume now |
+| `/quota idle [on\|off\|any\|waiting\|min N\|ttl M\|margin S]` | idle compaction: status and settings |
 | `/quota ctx [close]` | open / close the full context pane |
+
+## Idle compaction
+
+Prompt-cache reads are about a tenth of the price of fresh input. If a session sits idle longer than the cache lifetime, the next request re-sends the whole context at full price. Compacting just *before* the cache expires reads the context at the cheap cached rate and leaves a small context behind.
+
+- Fires once per response, `idleMarginSeconds` (default 180) before the cache would expire, when no turn is running and the context is at least `idleCompactMinTokens` (default 200,000).
+- Never fires after the cache has already gone cold, since it would save nothing.
+- By default any idle session qualifies. `/quota idle waiting` (or the `idleRequiresBackground` setting) restricts it to sessions waiting on a background command, monitor or agent; then the summary is told what it is waiting on.
+- Assumes a 1-hour cache (`cacheTtlMinutes`, default 60). If your sessions use the 5-minute cache, run `/quota idle ttl 5`.
+- Silent: no toast. `/quota status` shows the last idle compaction.
+- It is skipped while a quota pause is in progress, and a compaction cannot run while a turn is running (a long foreground command blocks it).
 
 ## Dry-run / test mode
 
