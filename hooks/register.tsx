@@ -89,7 +89,14 @@ function ctxPill(Svg: any, segs: { pct: number; hex: string }[], w: number, bh: 
 }
 
 function swatch(Svg: any, hex: string) {
-  return <Svg source={`<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" rx="3" fill="${hex}"/></svg>`} alt="" width={10} height={10} />
+  return (
+    <Svg
+      source={`<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10"><rect width="10" height="10" rx="3" fill="${hex}"/></svg>`}
+      alt="category colour"
+      width={10}
+      height={10}
+    />
+  )
 }
 
 function ctxBar(Box: any, segs: { pct: number; color: string }[], width: number) {
