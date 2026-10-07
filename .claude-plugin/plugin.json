@@ -1,0 +1,82 @@
+{
+  "name": "quota-guard",
+  "version": "0.1.0",
+  "description": "Compacts before the 5-hour/weekly usage limit is hit, pauses until it resets, then resumes the task automatically.",
+  "userConfig": {
+    "threshold": {
+      "type": "number",
+      "title": "5-hour threshold (%)",
+      "description": "Compact and pause when 5-hour usage reaches this percentage.",
+      "default": 94,
+      "min": 50,
+      "max": 99
+    },
+    "weeklyThreshold": {
+      "type": "number",
+      "title": "Weekly threshold (%)",
+      "description": "Compact and pause when weekly usage reaches this percentage.",
+      "default": 97,
+      "min": 50,
+      "max": 100
+    },
+    "weeklyPolicy": {
+      "type": "string",
+      "title": "Weekly limit policy",
+      "description": "pause = pause until the weekly reset; notify = only warn.",
+      "default": "pause"
+    },
+    "abortThreshold": {
+      "type": "number",
+      "title": "Abort running turn at (%)",
+      "description": "Interrupt a running turn at this usage instead of waiting for it to finish.",
+      "default": 98,
+      "min": 60,
+      "max": 100
+    },
+    "graceSeconds": {
+      "type": "number",
+      "title": "Grace after reset (s)",
+      "description": "Wait this long past the reported reset time before re-checking.",
+      "default": 30,
+      "min": 0,
+      "max": 600
+    },
+    "maxResumeAttempts": {
+      "type": "number",
+      "title": "Max resume attempts",
+      "description": "Stop auto-resuming after this many failed attempts per pause.",
+      "default": 5,
+      "min": 1,
+      "max": 20
+    },
+    "notifyAt": {
+      "type": "number",
+      "title": "Heads-up at (%)",
+      "description": "One toast when a window first reaches this usage. 0 disables.",
+      "default": 80,
+      "min": 0,
+      "max": 99
+    },
+    "enabled": {
+      "type": "boolean",
+      "title": "Enabled",
+      "description": "Automatic quota management on or off.",
+      "default": true
+    },
+    "testMode": {
+      "type": "boolean",
+      "title": "Test / dry-run mode",
+      "description": "Use simulated usage (/quota sim ...) and dry-run actions instead of real quota.",
+      "default": false
+    },
+    "compactMinContext": {
+      "type": "number",
+      "title": "Compact only above context (%)",
+      "description": "At the quota threshold, compact first only if the context window is fuller than this; otherwise just wait for the reset.",
+      "default": 30,
+      "min": 0,
+      "max": 100
+    }
+  },
+  "types": "./types/index.d.ts"
+}
