@@ -13,6 +13,7 @@ import {
   fmtDur,
   initialState,
   needsHeartbeat,
+  RESUME_PROMPT,
   statusLine,
   step,
 } from './core'
@@ -283,12 +284,12 @@ function logOnce($: any, err: unknown) {
   }
 }
 
-async function usable($: any): Promise<boolean> {
+async function usable($: any, gen: number): Promise<boolean> {
   try {
-    await ensure($)
+    await ensure($, gen)
     return true
   } catch (err) {
-    logOnce($, err)
+    if (gen === epoch) logOnce($, err) // a session that has ended is not an internal error
     return false
   }
 }
@@ -320,7 +321,10 @@ async function claimSlot($: any) {
 }
 
 
-async function ensure($: any): Promise<void> {
+// `gen` is the session generation the CALLER started in, captured before its first wait. A caller that
+// was overtaken by a session change must stop, even when another load has since filled S for the new one.
+async function ensure($: any, gen: number): Promise<void> {
+  if (gen !== epoch) throw new Error('the session changed')
   if (!commandReady) void registerCommand($)
   if (S) return
   loading ??= load($).catch(err => {
@@ -328,7 +332,7 @@ async function ensure($: any): Promise<void> {
     throw err
   })
   await loading
-  if (S === null) throw new Error('the session changed while its state was loading')
+  if (gen !== epoch || S === null) throw new Error('the session changed while its state was loading')
 }
 
 async function persist($: any) {
@@ -395,7 +399,8 @@ async function readUsage($: any): Promise<Usage | null> {
   }
 }
 
-async function publish($: any, usage: Usage | null, now: number) {
+async function publish($: any, usage: Usage | null, now: number, gen: number) {
+  if (gen !== epoch || S === null) return
   const st = S as State
   const five = usage?.windows.find(w => w.kind === FIVE)
   const week = usage?.windows.find(w => w.kind === WEEK)
@@ -410,7 +415,7 @@ async function publish($: any, usage: Usage | null, now: number) {
     ctxTokens = b.tokens ?? b.breakdown?.totalTokens
     ctxWindow = b.breakdown?.rawMaxTokens ?? b.window
     const bd = b.breakdown
-    if (bd) await update($, detail, () => buildDetail(bd, bd.apiUsage))
+    if (bd && gen === epoch) await update($, detail, () => buildDetail(bd, bd.apiUsage))
     if (bd && bd.rawMaxTokens > 0) {
       parts = bd.categories
         .filter((c: any) => c.kind === 'used' && c.tokens > 0)
@@ -440,21 +445,21 @@ async function publish($: any, usage: Usage | null, now: number) {
         ? `paused until ${fmtClock(st.rec.wakeAt)}`
         : usage ? undefined : 'waiting for first usage reading',
   }
+  if (gen !== epoch) return
   await update($, bar, () => v)
 }
 
 // ---------- dispatch / effects ----------
 
-async function dispatch($: any, ev: Ev): Promise<void> {
-  await ensure($)
-  const gen = epoch
+async function dispatch($: any, ev: Ev, gen: number): Promise<void> {
+  await ensure($, gen)
   if ((ev.type === 'measure' || ev.type === 'tick' || ev.type === 'forcePause') && !(await watched($))) return
   if (gen !== epoch || S === null) return
   const { state, fx } = step(S as State, ev, cfg)
   S = state
   await persist($)
   if (gen !== epoch) return // the session ended while persisting: nothing this produced applies any more
-  sync($)
+  sync($, gen)
   for (const f of fx) if (f.t === 'toast') say($, f.text)
   const rest = fx.filter(f => f.t !== 'toast')
   if (rest.length) void runEffects($, rest, gen).catch((err: unknown) => logOnce($, err))
@@ -466,22 +471,23 @@ function say($: any, text: string) {
   $.ui.log(PREFIX + t)
 }
 
-function sync($: any) {
+function sync($: any, gen: number) {
   if (needsHeartbeat(S as State)) {
-    timer ??= $.clock.every(HEARTBEAT_MS, () => void tick($).catch((err: unknown) => logOnce($, err)))
+    timer ??= $.clock.every(HEARTBEAT_MS, () => void tick($, gen).catch((err: unknown) => logOnce($, err)))
   } else if (timer) {
     timer.cancel()
     timer = undefined
   }
 }
 
-async function tick($: any) {
-  await ensure($)
+async function tick($: any, gen: number) {
+  await ensure($, gen)
   const now = await $.clock.now()
   const usage = await readUsage($)
+  if (gen !== epoch) return
   $.ui.status(statusLine(S as State, usage, now))
-  await dispatch($, { type: 'tick', now, usage })
-  await publish($, usage, now)
+  await dispatch($, { type: 'tick', now, usage }, gen)
+  await publish($, usage, now, gen)
 }
 
 async function runEffects($: any, list: Fx[], gen: number) {
@@ -528,15 +534,15 @@ async function doCompact($: any, instructions: string, op: number, gen: number) 
     }
   }
   if (gen !== epoch) return
-  await dispatch($, { type: 'compactDone', now: await $.clock.now(), ok, op })
+  await dispatch($, { type: 'compactDone', now: await $.clock.now(), ok, op }, gen)
 }
 
 async function doSubmit($: any, text: string, op: number, gen: number) {
   const wanted = () => gen === epoch && S !== null && S.rec.phase === 'resuming' && S.rec.op === op
   if (testMode && dryActions) {
     $.ui.log(PREFIX + `[dry-run] would submit: ${text.split('\n')[0]}`)
-    await dispatch($, { type: 'resumeDelivered', now: await $.clock.now(), op })
-    $.clock.after(1500, () => void syntheticMeasure($).catch((err: unknown) => logOnce($, err)))
+    await dispatch($, { type: 'resumeDelivered', now: await $.clock.now(), op }, gen)
+    $.clock.after(1500, () => void syntheticMeasure($, gen).catch((err: unknown) => logOnce($, err)))
     return
   }
   await claimSlot($)
@@ -545,7 +551,7 @@ async function doSubmit($: any, text: string, op: number, gen: number) {
     try {
       const r = await $.prompt.submit({ text })
       if (!r || r.drop === undefined) {
-        if (gen === epoch) await dispatch($, { type: 'resumeDelivered', now: await $.clock.now(), op })
+        if (gen === epoch) await dispatch($, { type: 'resumeDelivered', now: await $.clock.now(), op }, gen)
         return
       }
     } catch {
@@ -554,25 +560,30 @@ async function doSubmit($: any, text: string, op: number, gen: number) {
     await $.clock.sleep(5000)
   }
   if (!wanted()) return
-  await dispatch($, { type: 'submitFailed', now: await $.clock.now(), text, op })
+  await dispatch($, { type: 'submitFailed', now: await $.clock.now(), text, op }, gen)
 }
 
-async function syntheticMeasure($: any) {
+async function syntheticMeasure($: any, gen: number) {
+  if (gen !== epoch) return
   const now = await $.clock.now()
   const usage = await readUsage($)
-  if (usage) await dispatch($, { type: 'measure', now, usage })
-  await saveSim($)
+  if (gen !== epoch) return
+  if (usage) await dispatch($, { type: 'measure', now, usage }, gen)
+  if (gen === epoch) await saveSim($)
 }
 
-async function boot($: any) {
-  await ensure($)
+async function boot($: any, gen: number) {
+  await ensure($, gen)
   if (booted || !(await watched($))) return
+  if (gen !== epoch) return
   booted = true
   const now = await $.clock.now()
   const usage = await readUsage($)
-  await dispatch($, { type: 'boot', now, usage })
+  if (gen !== epoch) return // the session changed while the usage was being read
+  await dispatch($, { type: 'boot', now, usage }, gen)
+  if (gen !== epoch) return
   $.ui.status(statusLine(S as State, usage, now))
-  await publish($, usage, now)
+  await publish($, usage, now, gen)
 }
 
 // ---------- /quota ----------
@@ -594,13 +605,13 @@ async function contextTokens($: any): Promise<number | undefined> {
 
 // Idle compaction: while the session waits on background work, compact shortly before the prompt
 // cache expires so the next request does not re-send a huge context at full price. Silent by design.
-async function scheduleIdle($: any) {
+async function scheduleIdle($: any, gen: number) {
   idleTimer?.cancel()
   idleTimer = undefined
-  if (!idleCfg.enabled || lastResponseAt === undefined || (testMode && dryActions)) return
+  if (gen !== epoch || !idleCfg.enabled || lastResponseAt === undefined || (testMode && dryActions)) return
   const now = await $.clock.now()
   const tokens0 = await contextTokens($)
-  if (S === null) return
+  if (gen !== epoch || S === null) return
   const plan = planIdleCompact(idleCfg, {
     now,
     lastResponseAt,
@@ -610,19 +621,19 @@ async function scheduleIdle($: any) {
     quotaPhase: (S as State).rec.phase,
     lastIdleCompactAt,
   })
-  if (plan.act) void runIdle($).catch((err: unknown) => logOnce($, err))
+  if (plan.act) void runIdle($, gen).catch((err: unknown) => logOnce($, err))
   else if (plan.at !== undefined) {
-    idleTimer = $.clock.after(Math.max(1000, plan.at - now), () => void runIdle($).catch((err: unknown) => logOnce($, err)))
+    idleTimer = $.clock.after(Math.max(1000, plan.at - now), () => void runIdle($, gen).catch((err: unknown) => logOnce($, err)))
   }
 }
 
-async function runIdle($: any) {
+async function runIdle($: any, gen: number) {
   idleTimer = undefined
-  await ensure($)
+  await ensure($, gen)
   if (testMode && dryActions) return // dry-run: never touch the real conversation
   const now = await $.clock.now()
   const tokens = await contextTokens($)
-  if (S === null) return
+  if (gen !== epoch || S === null) return
   const plan = planIdleCompact(idleCfg, {
     now,
     lastResponseAt,
@@ -633,12 +644,13 @@ async function runIdle($: any) {
     lastIdleCompactAt,
   })
   if (!plan.act) {
-    if (plan.at !== undefined) await scheduleIdle($)
+    if (plan.at !== undefined) await scheduleIdle($, gen)
     return
   }
   lastIdleCompactAt = now // once per response, whatever happens next
   try {
     const r = await $.session.compact({ instructions: idleInstructions(freshPending(waiting, now), (S as State).rec.task) })
+    if (gen !== epoch) return // this compaction belonged to a session that has since ended
     if (r && r.skip === undefined) {
       idleStats = { at: now, before: tokens ?? 0, count: (idleStats?.count ?? 0) + 1 }
       await $.store.set('idle:' + sid, idleStats)
@@ -680,7 +692,7 @@ async function describe($: any): Promise<string> {
   return lines.join('\n')
 }
 
-async function startSim($: any, what: string, arg?: string): Promise<string> {
+async function startSim($: any, what: string, arg: string | undefined, gen: number): Promise<string> {
   const now = await $.clock.now()
   sim ??= { five: { percent: 10, resetsAt: now + 5 * 3600_000 }, mode: 'ok', failedOnce: false, probeFails: 0, unavailable: false }
   const set = (p: number, ms: number) => {
@@ -707,22 +719,23 @@ case 'ctx': {
     case 'restart': {
       timer?.cancel()
       timer = undefined
+      epoch++ // a restart ends everything that was in flight
       S = null
       loading = undefined
       booted = false
       turnId = undefined
-      await boot($)
+      await boot($, epoch)
       return 'Simulated restart: in-memory state dropped and reloaded from the store.'
     }
     default:
       return 'sim: ctx N | 80 | 94 | exhausted | reset60 | weekly | reset-ok | reset-fail | reset-delay | unavailable | clear | restart'
   }
   await saveSim($)
-  if (['80', '94', 'exhausted', 'reset60', 'weekly', 'clear'].includes(what)) await syntheticMeasure($)
+  if (['80', '94', 'exhausted', 'reset60', 'weekly', 'clear'].includes(what)) await syntheticMeasure($, gen)
   return `sim ${what} applied. Five-hour: ${sim.five.percent}% (resets ${fmtClock(sim.five.resetsAt)}), mode ${sim.mode}${sim.unavailable ? ', usage unavailable' : ''}.`
 }
 
-async function command($: any, args: string): Promise<string> {
+async function command($: any, args: string, gen: number): Promise<string> {
   const [cmd = 'status', a, b] = args.split(/\s+/)
   const now = await $.clock.now()
   switch (cmd.toLowerCase()) {
@@ -731,7 +744,7 @@ async function command($: any, args: string): Promise<string> {
     case 'on':
     case 'off':
       cfg.enabled = cmd === 'on'
-      if (!cfg.enabled) await dispatch($, { type: 'cancel', now })
+      if (!cfg.enabled) await dispatch($, { type: 'cancel', now }, gen)
       await saveCfg($)
       return `Automatic quota management ${cfg.enabled ? 'enabled' : 'disabled'}.`
     case 'threshold':
@@ -746,14 +759,14 @@ async function command($: any, args: string): Promise<string> {
     case 'pause': {
       const m = a ? Number(a) : 2
       if (!Number.isFinite(m) || m < 0.1) return 'Usage: /quota pause [minutes]'
-      await dispatch($, { type: 'forcePause', now, minutes: m })
+      await dispatch($, { type: 'forcePause', now, minutes: m }, gen)
       return `Forced pause requested for ${m} minute(s)${testMode && dryActions ? ' (dry-run: no real compaction)' : ' (real compaction will run)'}.`
     }
     case 'cancel':
-      await dispatch($, { type: 'cancel', now })
+      await dispatch($, { type: 'cancel', now }, gen)
       return 'Cancel processed.'
     case 'resume':
-      await dispatch($, { type: 'resume', now })
+      await dispatch($, { type: 'resume', now }, gen)
       return 'Resume processed.'
     case 'test': {
       if (a === 'on' || a === 'off') {
@@ -774,7 +787,7 @@ async function command($: any, args: string): Promise<string> {
         await $.ui.close({ id: PANE })
         return 'Context pane closed.'
       }
-      await publish($, await readUsage($), now)
+      await publish($, await readUsage($), now, gen)
       await $.ui.open({ id: PANE, title: 'Context' })
       return 'Context pane opened (each category has its own colour, largest first).'
     case 'idle': {
@@ -794,7 +807,7 @@ async function command($: any, args: string): Promise<string> {
         idleCfg = { ...idleCfg, marginMs: sec * 1000 }
       } else if (a !== undefined && a !== '' && a !== 'status') return 'Usage: /quota idle [on|off|any|waiting|min N|ttl M|margin S]'
       await saveCfg($)
-      await scheduleIdle($)
+      await scheduleIdle($, gen)
       return idleLine(now)
     }
     case 'ctxmin': {
@@ -806,15 +819,16 @@ async function command($: any, args: string): Promise<string> {
     }
     case 'sim':
       if (!testMode) return 'Turn on test mode first: /quota test on'
-return startSim($, a ?? '', b)
+return startSim($, a ?? '', b, gen)
     default:
       return 'Commands: status | on | off | threshold N | weekly N | pause [min] | cancel | resume | test on|off | test actions real|dry | sim <scenario>'
   }
 }
 
 async function runQuota($: any, e: { args: string }) {
-  if (!(await usable($))) return { text: PREFIX + 'not available (could not load saved state).' }
-  return { text: await command($, e.args.trim()) }
+  const gen = epoch
+  if (!(await usable($, gen))) return { text: PREFIX + 'not available (could not load saved state).' }
+  return { text: await command($, e.args.trim(), gen) }
 }
 
 export const register: Register = (on, opts) => {
@@ -823,9 +837,10 @@ export const register: Register = (on, opts) => {
   // ---------- hooks (every one fails open) ----------
 
   on('session.start', async ($, e, next) => {
+    const gen = epoch
     try {
       await registerCommand($)
-      await boot($)
+      await boot($, gen)
       void $.ui.open({ id: PANE, title: 'Context' })
     } catch (err) {
       logOnce($, err)
@@ -835,8 +850,9 @@ export const register: Register = (on, opts) => {
 
   // a UI attaching after start (Desktop attaches late): run the startup check then
   on('session.attach', async ($, e, next) => {
+    const gen = epoch
     try {
-      await boot($)
+      await boot($, gen)
     } catch (err) {
       logOnce($, err)
     }
@@ -844,14 +860,17 @@ export const register: Register = (on, opts) => {
   })
 
   on('session.measure', async ($, e, next) => {
-    if (await usable($)) {
+    const gen = epoch
+    if (await usable($, gen)) {
       try {
         const now = await $.clock.now()
         const usage = testMode ? await readUsage($) : mapUsage(e)
-        if (usage) {
-          await dispatch($, { type: 'measure', now, usage })
-          $.ui.status(statusLine(S as State, usage, now))
-          await publish($, usage, now)
+        if (usage && gen === epoch) {
+          await dispatch($, { type: 'measure', now, usage }, gen)
+          if (gen === epoch) {
+            $.ui.status(statusLine(S as State, usage, now))
+            await publish($, usage, now, gen)
+          }
         }
       } catch (err) {
         logOnce($, err)
@@ -861,11 +880,14 @@ export const register: Register = (on, opts) => {
   })
 
   on('turn.start', async ($, e, next) => {
+    const gen = epoch
     turnId = e.turnId
     idleTimer?.cancel()
     idleTimer = undefined
     try {
-      await dispatch($, { type: 'turnStart', turnId: e.turnId })
+      // our own continuation is recognised by its text; anything else that starts is another turn
+      const owns = typeof e.text === 'string' ? e.text.includes(RESUME_PROMPT) : undefined
+      await dispatch($, { type: 'turnStart', turnId: e.turnId, owns }, gen)
     } catch (err) {
       logOnce($, err)
     }
@@ -873,15 +895,17 @@ export const register: Register = (on, opts) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    const gen = epoch
     const r = await next(e)
     if (e.agentId === undefined) {
-      turnId = undefined
+      if (turnId === e.turnId) turnId = undefined // a late completion of an older turn must not erase the current one
       try {
         // detached: this hook must return before a compaction can run
         const at = await $.clock.now()
+        if (gen !== epoch) return r
         if (e.reason === 'answer' || e.reason === 'refusal') lastResponseAt = at // an errored or interrupted turn refreshed nothing
-        void dispatch($, { type: 'turnComplete', now: at, reason: e.reason, turnId: e.turnId })
-          .then(() => scheduleIdle($))
+        void dispatch($, { type: 'turnComplete', now: at, reason: e.reason, turnId: e.turnId }, gen)
+          .then(() => scheduleIdle($, gen))
           .catch((err: unknown) => logOnce($, err))
       } catch (err) {
         logOnce($, err)
@@ -891,8 +915,9 @@ export const register: Register = (on, opts) => {
   })
 
   on('prompt.submit', async ($, e, next) => {
+    const gen = epoch
     const kind = e.origin?.kind
-    if ((kind === 'plugin' && e.origin?.name === $.plugin.name) || !(await usable($))) return next(e)
+    if ((kind === 'plugin' && e.origin?.name === $.plugin.name) || !(await usable($, gen))) return next(e)
     try {
       idleTimer?.cancel()
       idleTimer = undefined
@@ -902,7 +927,7 @@ export const register: Register = (on, opts) => {
       }
       if (kind === 'task-notification') waiting = clearOnNotification(waiting, e.text)
       lastText = e.text
-      await dispatch($, { type: 'userPrompt', now: await $.clock.now(), text: e.text, isUser })
+      await dispatch($, { type: 'userPrompt', now: await $.clock.now(), text: e.text, isUser }, gen)
     } catch (err) {
       logOnce($, err)
     }
@@ -910,12 +935,13 @@ export const register: Register = (on, opts) => {
   }).catch(($, e, next) => next(e))
 
   on('session.compact', async ($, e, next) => {
+    const gen = epoch
     const r = await next(e)
     try {
-      if (e.agentId === undefined && e.trigger !== 'precompute' && r && r.skip === undefined && (await usable($))) {
+      if (gen === epoch && e.agentId === undefined && e.trigger !== 'precompute' && r && r.skip === undefined && (await usable($, gen))) {
         // our own compaction is reported by doCompact; this catches everyone else's
-        if ((S as State).rec.phase !== 'compacting') {
-          await dispatch($, { type: 'compactDone', now: await $.clock.now(), ok: true, external: true })
+        if (gen === epoch && S !== null && S.rec.phase !== 'compacting') {
+          await dispatch($, { type: 'compactDone', now: await $.clock.now(), ok: true, external: true }, gen)
         }
       }
     } catch (err) {
@@ -925,13 +951,14 @@ export const register: Register = (on, opts) => {
   }).catch(($, e, next) => next(e))
 
   on('tool.call', async ($, e, next) => {
+    const gen = epoch
     try {
-      if ((await usable($)) && cfg.enabled && (S as State).rec.phase === 'paused' && (await watched($))) {
+      if ((await usable($, gen)) && cfg.enabled && S !== null && S.rec.phase === 'paused' && (await watched($))) {
         return { deny: PREFIX + 'paused until the usage limit resets.' }
       }
       if (e.agentId === undefined) {
         const w = pendingFromTool(e.tool, e as unknown as Record<string, unknown>, String(e.tool_use_id ?? ''), await $.clock.now())
-        if (w) waiting = [...freshPending(waiting, w.at), w].slice(-20)
+        if (w && gen === epoch) waiting = [...freshPending(waiting, w.at), w].slice(-20)
       }
     } catch (err) {
       logOnce($, err)
@@ -940,7 +967,7 @@ export const register: Register = (on, opts) => {
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (!(await usable($))) return next(e)
+    if (!(await usable($, epoch))) return next(e)
     if (e.props.hasSurvey) return next(e)
     const v = await read($, bar)
     const { Box, Text } = $.ui.resolve(e)
@@ -1014,7 +1041,7 @@ export const register: Register = (on, opts) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
-    if (!(await usable($))) return next(e)
+    if (!(await usable($, epoch))) return next(e)
     const d = await read($, detail)
     const { Box, Text } = $.ui.resolve(e)
     const Svg = (e.surface !== 'terminal' ? ($.ui.resolve(e) as any).Svg : undefined) as any

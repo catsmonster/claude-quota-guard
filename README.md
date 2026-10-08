@@ -119,7 +119,7 @@ No need to burn real quota:
 - Pause records are keyed by session id.
 - Weekly pauses can last days and only resume while the session stays loaded.
 - Compaction needs an API call, so at 100% it can fail; the mod then pauses anyway.
-- Automatic prompts (scheduled tasks, background-task notifications, other plugins) arriving during a pause are **dropped**, not queued, so a completion notice that lands while paused is lost. Your own prompts are never held, and sending one cancels the pause.
+- Automatic prompts (scheduled tasks, background-task notifications, other plugins) arriving during a pause, or while the resume prompt is waiting to be sent, are **dropped**, not queued, so a completion notice that lands while paused is lost. Your own prompts are never held, and sending one cancels the pause.
 - Resume slots across several sessions are claimed through a shared store without an atomic reservation, so two sessions waking in the same instant can still land close together; the 20-second spacing is best effort.
 - Saved state is kept per session in the plugin's store: the 25 most recently active sessions are retained and older ones are forgotten, except a record with an unresolved pause or resume, which is never discarded. Records written before this existed are adopted on first load.
 - Pruning the shared store re-reads a record right before deleting it, but the plugin store has no compare-and-delete, so a pause written by another session in that instant could still be lost. The window is very small.

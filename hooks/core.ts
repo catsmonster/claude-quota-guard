@@ -60,6 +60,10 @@ export type Rec = {
   resets?: Record<string, number> // each window's reset time when the pause began: a reset is THAT window moving on
   verifiedKinds?: string[] // the windows the quota evidence covered when it was taken
   olderTurnRunning?: boolean // a turn was already running when this resume began: its completion is not ours
+  olderTurnId?: string // ...and which one
+  turnId?: string // the turn that is this resume's continuation, once it has started
+  foreignTurns?: string[] // turns that started during this resume and are not its continuation
+  causes?: Record<string, 'static' | 'predictive'> // why each window is part of the pause
 }
 
 export type State = {
@@ -77,7 +81,7 @@ export type State = {
 
 export type Ev =
   | { type: 'measure'; now: number; usage: Usage }
-  | { type: 'turnStart'; turnId?: string }
+  | { type: 'turnStart'; turnId?: string; owns?: boolean }
   | { type: 'turnComplete'; now: number; reason: string; turnId?: string }
   | { type: 'userPrompt'; now: number; text: string; isUser: boolean }
   | { type: 'compactDone'; now: number; ok: boolean; op?: number; external?: boolean }
@@ -164,7 +168,12 @@ function breaches(u: Usage, s: State, cfg: Config): Win[] {
 const backoffMs = (n: number) => (BACKOFF_SEC[Math.min(n, BACKOFF_SEC.length - 1)] ?? 900) * 1000
 
 export function blocksAutomation(s: State): boolean {
-  return s.rec.phase === 'paused' || s.rec.phase === 'stopped' || s.rec.phase === 'compacting'
+  return (
+    s.rec.phase === 'paused' ||
+    s.rec.phase === 'stopped' ||
+    s.rec.phase === 'compacting' ||
+    (s.rec.phase === 'resuming' && !s.rec.delivered)
+  )
 }
 
 export function compactInstructions(task: string): string {
@@ -196,6 +205,20 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     const m = new Set(r.kinds.filter(k => limitFor(k, cfg) !== undefined))
     for (const k of s.known) if (limitFor(k, cfg) !== undefined) m.add(k)
     return m
+  }
+  // Why a window is in the pause: over its limit (static), or only predicted to be (burn rate). A
+  // predictive cause is cleared only by THAT window moving on, never by another window's reset.
+  const causeOf = (k: string): 'static' | 'predictive' => r.causes?.[k] ?? (r.predictive ? 'predictive' : 'static')
+  const advanced = (k: string, w: Win | undefined) =>
+    w !== undefined && w.resetsAt !== undefined && w.resetsAt > (r.resets?.[k] ?? r.expectedReset ?? 0) + 120_000
+  const predictiveCleared = (u: Usage) => r.kinds.every(k => causeOf(k) !== 'predictive' || advanced(k, u.windows.find(x => x.kind === k)))
+  // a window that breaches after the pause began joins it, with its own cause and baseline
+  const join = (w: Win) => {
+    if (!r.kinds.includes(w.kind)) r.kinds.push(w.kind)
+    r.causes ??= {}
+    r.causes[w.kind] ??= w.percent >= (limitFor(w.kind, cfg) ?? Infinity) ? 'static' : 'predictive'
+    r.resets ??= {}
+    if (w.resetsAt !== undefined) r.resets[w.kind] ??= w.resetsAt
   }
 
   const settle = (task = r.task) => {
@@ -240,6 +263,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       usage: all ? all.windows.map(w => ({ ...w })) : wins.map(w => ({ ...w })),
       predictive: wins.every(w => w.percent < (limitFor(w.kind, cfg) ?? Infinity)),
       resets: Object.fromEntries((all ? all.windows : wins).filter(w => w.resetsAt !== undefined).map(w => [w.kind, w.resetsAt as number])),
+      causes: Object.fromEntries(wins.map(w => [w.kind, w.percent >= (limitFor(w.kind, cfg) ?? Infinity) ? 'static' : 'predictive'])) as Rec['causes'],
     }
     for (const k of Object.keys(r)) delete (r as Record<string, unknown>)[k]
     Object.assign(r, fresh)
@@ -275,6 +299,9 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     r.verified = false
     r.verifiedKinds = undefined
     r.olderTurnRunning = s.busy
+    r.olderTurnId = s.busy ? s.turnId : undefined
+    r.turnId = undefined
+    r.foreignTurns = undefined
     r.resumeAttempts++
     r.lastResumeAt = now
     toast(
@@ -293,6 +320,9 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     r.verified = false
     r.verifiedKinds = undefined
     r.olderTurnRunning = false
+    r.olderTurnId = undefined
+    r.turnId = undefined
+    r.foreignTurns = undefined
     r.delayCount++
     if (r.resumeAttempts >= cfg.maxResumeAttempts) {
       r.phase = 'stopped'
@@ -330,9 +360,12 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
         continue
       }
       if (w.percent >= lim) {
-        if (!r.kinds.includes(k)) r.kinds.push(k)
+        join(w)
         if (w.resetsAt !== undefined && w.resetsAt > now) limited.push(w.resetsAt)
         else stale = true // reading predates the reset; only a fresh response can tell
+      } else if (r.kinds.includes(k) && causeOf(k) === 'predictive' && !advanced(k, w)) {
+        if (w.resetsAt !== undefined && w.resetsAt > now) limited.push(w.resetsAt) // still the window that was about to run out
+        else stale = true
       }
     }
     if (limited.length) {
@@ -357,6 +390,55 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     // (and never queue a second probe behind it); only a prompt that never started is a failure
     else if (r.phase === 'resuming' && !s.busy && r.lastResumeAt !== undefined && now - r.lastResumeAt > RESUME_WATCHDOG_MS) {
       resumeFailed(now, 'no response to the resume prompt')
+    }
+  }
+
+  // Evidence about a resume in flight. Only a reading that is evidence counts. Under the limit in EVERY
+  // managed window we have ever seen (and every predictive cause moved on): the reset happened. Over a
+  // limit with a reset still ahead: it did not. Over it with a reset already past, a window missing, or an
+  // unchanged snapshot of a burn-rate pause: the old reading again, no evidence either way. Later evidence
+  // can contradict earlier evidence, so verification is withdrawn rather than latched.
+  const assessResuming = (now: number, u: Usage, hit: Win[]) => {
+    const managed = managedKinds()
+    const limitedResets: number[] = []
+    let allLow = managed.size > 0
+    let anyHigh = false
+    for (const k of managed) {
+      const w = u.windows.find(x => x.kind === k)
+      const lim = limitFor(k, cfg) ?? cfg.threshold
+      if (!w) {
+        allLow = false
+        continue
+      }
+      if (w.percent >= lim) {
+        allLow = false
+        anyHigh = true
+        if (w.resetsAt !== undefined && w.resetsAt > now) limitedResets.push(w.resetsAt)
+      }
+    }
+    // a window that was fine when the pause began but is exhausted now blocks the resume too
+    for (const w of hit) {
+      if (r.kinds.includes(w.kind) || w.resetsAt === undefined || w.resetsAt <= now) continue
+      join(w)
+      limitedResets.push(w.resetsAt)
+      allLow = false
+      anyHigh = true
+    }
+    if (limitedResets.length) {
+      resumeFailed(now, 'quota still exhausted', Math.max(...limitedResets))
+    } else if (allLow && predictiveCleared(u)) {
+      // quota is verified; the task is only done once its continuation was actually delivered
+      if (r.delivered) {
+        const task = r.task
+        settle(task)
+        toast('Quota reset verified.')
+      } else {
+        r.verified = true
+        r.verifiedKinds = [...managed]
+      }
+    } else if (anyHigh) {
+      r.verified = false
+      r.verifiedKinds = undefined
     }
   }
 
@@ -389,55 +471,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       const hit = breaches(u, s, cfg)
 
       if (r.phase === 'resuming') {
-        // Only a reading that is evidence counts. Under the limit in EVERY managed window we have ever
-        // seen: the reset happened. Over it with a reset still ahead: it did not. Over it with a reset
-        // already past, a window missing, or an unchanged snapshot of a burn-rate pause: the old
-        // reading again, no evidence either way, so keep waiting for the turn's own outcome.
-        const managed = managedKinds()
-        const limitedResets: number[] = []
-        let allLow = managed.size > 0
-        let anyHigh = false
-        let newWindow = false
-        for (const k of managed) {
-          const w = u.windows.find(x => x.kind === k)
-          const lim = limitFor(k, cfg) ?? cfg.threshold
-          if (!w) {
-            allLow = false
-            continue
-          }
-          // a reset is the window that caused the pause moving on; another window's timestamp says nothing
-          if (r.kinds.includes(k) && w.resetsAt !== undefined && w.resetsAt > (r.resets?.[k] ?? r.expectedReset ?? 0) + 120_000) newWindow = true
-          if (w.percent >= lim) {
-            allLow = false
-            anyHigh = true
-            if (w.resetsAt !== undefined && w.resetsAt > ev.now) limitedResets.push(w.resetsAt)
-          }
-        }
-        // a window that was fine when the pause began but is exhausted now blocks the resume too
-        for (const w of hit) {
-          if (r.kinds.includes(w.kind) || w.resetsAt === undefined || w.resetsAt <= ev.now) continue
-          r.kinds.push(w.kind)
-          limitedResets.push(w.resetsAt)
-          allLow = false
-          anyHigh = true
-        }
-        if (limitedResets.length) {
-          resumeFailed(ev.now, 'quota still exhausted', Math.max(...limitedResets))
-        } else if (allLow && (!r.predictive || newWindow)) {
-          // quota is verified; the task is only done once its continuation was actually delivered
-          if (r.delivered) {
-            const task = r.task
-            settle(task)
-            toast('Quota reset verified.')
-          } else {
-            r.verified = true
-            r.verifiedKinds = [...managed]
-          }
-        } else if (anyHigh) {
-          // contradicting evidence withdraws an earlier verification
-          r.verified = false
-          r.verifiedKinds = undefined
-        }
+        assessResuming(ev.now, u, hit)
         break
       }
       if (r.phase === 'idle') {
@@ -461,7 +495,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
         r.usage = u.windows.map(w => ({ ...w }))
         // a window that is exhausted after arming joins the pause and sets how long it lasts
         for (const w of hit) {
-          if (!r.kinds.includes(w.kind)) r.kinds.push(w.kind)
+          join(w)
           if (w.resetsAt !== undefined) r.expectedReset = Math.max(r.expectedReset ?? 0, w.resetsAt)
         }
         const worst = hit.reduce((m, w) => Math.max(m, w.percent), 0)
@@ -472,30 +506,30 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
         break
       }
       if (r.phase === 'paused') {
-        for (const w of hit) if (!r.kinds.includes(w.kind)) r.kinds.push(w.kind)
-        const managed = new Set(r.kinds.filter(k => limitFor(k, cfg) !== undefined))
-        for (const k of s.known) if (limitFor(k, cfg) !== undefined) managed.add(k)
+        for (const w of hit) join(w)
+        const managed = managedKinds()
         const blocking: number[] = []
         let allLow = managed.size > 0
-        let newWindow = false
         for (const k of managed) {
           const w = u.windows.find(x => x.kind === k)
           const lim = limitFor(k, cfg) ?? cfg.threshold
           if (!w || w.percent >= lim) allLow = false
-          if (w && r.kinds.includes(k) && w.resetsAt !== undefined && w.resetsAt > (r.resets?.[k] ?? r.expectedReset ?? 0) + 120_000) newWindow = true
           if (w && w.percent >= lim && w.resetsAt !== undefined && w.resetsAt > ev.now) blocking.push(w.resetsAt)
+          // a predictive cause that has not moved on keeps blocking until ITS OWN reset, whatever joined it
+          if (w && r.kinds.includes(k) && causeOf(k) === 'predictive' && !advanced(k, w) && w.resetsAt !== undefined && w.resetsAt > ev.now) {
+            blocking.push(w.resetsAt)
+          }
         }
         if (blocking.length) {
-          // only a reading that is still over the limit can move the wake time
+          // only a reading that is still blocking can move the wake time
           const next = Math.max(...blocking)
           if (r.expectedReset === undefined || Math.abs(next - r.expectedReset) > 60_000) {
             r.expectedReset = next
             r.wakeAt = next + cfg.graceSec * 1000
             toast(`Reset time changed; now paused until approximately ${fmtClock(r.wakeAt)}.`)
           }
-        } else if (allLow && (!r.predictive || newWindow) && r.wakeAt !== undefined && r.wakeAt > ev.now) {
-          // a fresh reading under the limit means the reset already happened. A burn-rate pause is not
-          // over when the very reading that caused it comes in again: it needs a new window.
+        } else if (allLow && predictiveCleared(u) && r.wakeAt !== undefined && r.wakeAt > ev.now) {
+          // a fresh reading under every limit, with each burn-rate cause moved on, means the reset already happened
           r.wakeAt = ev.now
         }
       }
@@ -505,19 +539,39 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     case 'turnStart':
       s.busy = true
       s.turnId = ev.turnId
+      if (r.phase === 'resuming') {
+        // a turn that begins while resuming is the continuation's only if it is known to be (the adapter
+        // recognises our prompt); with no information, one that starts before delivery cannot be
+        const own = ev.owns ?? r.delivered === true
+        if (own) r.turnId = ev.turnId
+        else if (ev.turnId !== undefined) r.foreignTurns = [...(r.foreignTurns ?? []), ev.turnId]
+      }
       break
 
     case 'turnComplete': {
+      const id = ev.turnId
+      const currentEnds = id === undefined || s.turnId === undefined || id === s.turnId
+      if (!currentEnds) {
+        // a late completion for a turn that is no longer the current one: it ends nothing that is running now
+        if (r.phase === 'resuming' && id === r.olderTurnId) r.olderTurnRunning = false
+        break
+      }
       s.busy = false
       s.turnId = undefined
       if (r.phase === 'armed') {
         if (r.compactedAt !== undefined) enterPause(ev.now)
         else compactOrPause(ev.now)
-      } else if (r.phase === 'resuming' && r.olderTurnRunning) {
-        // that was the turn already running when this resume began, not the continuation's turn
-        r.olderTurnRunning = false
       } else if (r.phase === 'resuming') {
-        if (ev.reason === 'error') resumeFailed(ev.now, 'API error')
+        const ours =
+          id === undefined
+            ? !r.olderTurnRunning
+            : r.turnId !== undefined
+              ? id === r.turnId
+              : !(r.foreignTurns ?? []).includes(id) && id !== r.olderTurnId
+        if (!ours) {
+          // the turn that was already running when this resume began, or another turn: not the continuation
+          if (id === undefined || id === r.olderTurnId) r.olderTurnRunning = false
+        } else if (ev.reason === 'error') resumeFailed(ev.now, 'API error')
         else if (ev.reason === 'aborted') {
           settle()
           toast('Resume turn was interrupted; auto-resume finished.')
@@ -562,6 +616,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     }
 
     case 'tick':
+      if (r.phase === 'resuming' && ev.usage) assessResuming(ev.now, ev.usage, breaches(ev.usage, s, cfg))
       tickLike(ev.now, ev.usage)
       break
 
