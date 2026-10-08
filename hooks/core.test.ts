@@ -13,7 +13,8 @@ const u = (pct: number, resetsAt = T0 + 90 * MIN, extra: Usage['windows'] = []):
 function run(s: State, ...evs: Ev[]) {
   let state = s
   const fx: Fx[] = []
-  for (const ev of evs) {
+  for (let ev of evs) {
+    if (ev.type === 'compactDone' && !ev.external && ev.op === undefined) ev = { ...ev, op: state.rec.op }
     const r = step(state, ev, cfg)
     state = r.state
     fx.push(...r.fx)
@@ -128,7 +129,12 @@ test('never loops forever: gives up after maxResumeAttempts', () => {
 })
 
 test('successful resume is confirmed by next measurement and clears the record', () => {
-  const r = run(pausedState(), { type: 'tick', now: T0 + 91 * MIN, usage: u(2, T0 + 300 * MIN) }, { type: 'measure', now: T0 + 92 * MIN, usage: u(3, T0 + 300 * MIN) })
+  const woke = run(pausedState(), { type: 'tick', now: T0 + 91 * MIN, usage: u(2, T0 + 300 * MIN) }).state
+  const r = run(
+    woke,
+    { type: 'resumeDelivered', now: T0 + 91 * MIN, op: woke.rec.op as number },
+    { type: 'measure', now: T0 + 92 * MIN, usage: u(3, T0 + 300 * MIN) },
+  )
   expect(r.state.rec.phase).toBe('idle')
   expect(r.state.rec.task).toBe('refactor the parser module')
 })
@@ -169,8 +175,12 @@ test('cancel holds without re-arming; resume forces a resume', () => {
 })
 
 test('submit failure falls back to the prompt box', () => {
-  const r = run(pausedState(), { type: 'submitFailed', now: T0, text: 'continue' })
+  const resuming = run(pausedState(), { type: 'tick', now: T0 + 91 * MIN, usage: u(2, T0 + 300 * MIN) }).state
+  const r = run(resuming, { type: 'submitFailed', now: T0 + 92 * MIN, text: 'continue', op: resuming.rec.op as number })
   expect(has(r.fx, 'fill')).toBe(true)
+  // a failure that names some other (older) operation is stale and changes nothing
+  const stale = run(resuming, { type: 'submitFailed', now: T0 + 92 * MIN, text: 'continue', op: (resuming.rec.op as number) - 1 })
+  expect(stale.state.rec.phase).toBe('resuming')
 })
 
 test('already near the limit at load arms immediately', () => {

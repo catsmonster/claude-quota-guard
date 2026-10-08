@@ -31,8 +31,27 @@ test('while resuming, only readings under every limit verify the reset', () => {
   expect(s.rec.phase).toBe('resuming')
   // the five-hour window recovered, the weekly one is not known to have: not verified yet
   expect(step(s, { type: 'measure', now: T + 3 * MIN, usage: { windows: [five(3, T + 300 * MIN)] } }, DEFAULTS).state.rec.phase).toBe('resuming')
-  // both under their limits: verified
-  expect(step(s, { type: 'measure', now: T + 3 * MIN, usage: { windows: [five(3, T + 300 * MIN), week(10)] } }, DEFAULTS).state.rec.phase).toBe('idle')
+  // both under their limits, and the continuation delivered: verified
+  const delivered = step(s, { type: 'resumeDelivered', now: T + 3 * MIN, op: s.rec.op as number }, DEFAULTS).state
+  expect(step(delivered, { type: 'measure', now: T + 3 * MIN, usage: { windows: [five(3, T + 300 * MIN), week(10)] } }, DEFAULTS).state.rec.phase).toBe('idle')
+})
+
+test('quota verified before the prompt is delivered does not finish the resume; delivery then does', () => {
+  const s = run(initialState(), { type: 'measure', now: T, usage: { windows: [five(95)], contextPercent: 10 } })
+  const woke = run(s, { type: 'tick', now: T + 2 * MIN, usage: { windows: [five(95)] } })
+  expect(woke.rec.phase).toBe('resuming')
+  const seen = step(woke, { type: 'measure', now: T + 3 * MIN, usage: { windows: [five(3, T + 300 * MIN)] } }, DEFAULTS).state
+  expect(seen.rec.phase).toBe('resuming') // not done: the prompt has not gone out
+  expect(seen.rec.verified).toBe(true)
+  const done = step(seen, { type: 'resumeDelivered', now: T + 3 * MIN, op: seen.rec.op as number }, DEFAULTS).state
+  expect(done.rec.phase).toBe('idle')
+})
+
+test('a delivery or failure for an old operation changes nothing', () => {
+  const woke = run(initialState(), { type: 'measure', now: T, usage: { windows: [five(95)], contextPercent: 10 } }, { type: 'tick', now: T + 2 * MIN, usage: { windows: [five(95)] } })
+  const op = woke.rec.op as number
+  expect(step(woke, { type: 'resumeDelivered', now: T + 3 * MIN, op: op - 1 }, DEFAULTS).state.rec.delivered).toBe(false)
+  expect(step(woke, { type: 'resumeDelivered', now: T + 3 * MIN, op }, DEFAULTS).state.rec.delivered).toBe(true)
 })
 
 test('a pause is released early by a fresh reading under the limit', () => {

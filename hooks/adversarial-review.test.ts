@@ -167,7 +167,8 @@ test('the existing prompt safety fixture reaches its intended initialization fai
 })
 
 test('control: fresh low usage confirms a resumed probe', () => {
-  const s = run(paused(), { type: 'tick', now: T + 2 * MIN, usage: usage(95) })
+  const woke = run(paused(), { type: 'tick', now: T + 2 * MIN, usage: usage(95) })
+  const s = run(woke, { type: 'resumeDelivered', now: T + 2 * MIN, op: woke.rec.op as number }) // delivered first (see adversarial-fixes-review)
   const r = step(s, { type: 'measure', now: T + 2 * MIN, usage: usage(3, T + 300 * MIN) }, DEFAULTS)
   expect(r.state.rec.phase).toBe('idle')
 })

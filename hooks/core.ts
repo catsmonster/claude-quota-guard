@@ -53,6 +53,10 @@ export type Rec = {
   delayCount: number
   lastResumeAt?: number
   abortRequested?: boolean
+  op?: number // identity of the compaction / resume in flight; a completion for any other op is stale
+  delivered?: boolean // the session accepted this resume's prompt
+  verified?: boolean // quota was seen to have reset (it can be seen before the prompt is delivered)
+  predictive?: boolean // paused on the burn-rate prediction, not on a static limit
 }
 
 export type State = {
@@ -63,6 +67,8 @@ export type State = {
   last?: { pct: number; resetsAt?: number }
   notified: string[]
   ctx?: number // last known context-window fill, %
+  opSeq: number // source of operation identities
+  known: string[] // managed windows ever seen: a resume is only verified if all of them read healthy
 }
 
 export type Ev =
@@ -70,10 +76,11 @@ export type Ev =
   | { type: 'turnStart' }
   | { type: 'turnComplete'; now: number; reason: string }
   | { type: 'userPrompt'; now: number; text: string; isUser: boolean }
-  | { type: 'compactDone'; now: number; ok: boolean; external?: boolean }
+  | { type: 'compactDone'; now: number; ok: boolean; op?: number; external?: boolean }
   | { type: 'tick'; now: number; usage: Usage | null }
   | { type: 'boot'; now: number; usage: Usage | null }
-  | { type: 'submitFailed'; now: number; text: string }
+  | { type: 'submitFailed'; now: number; text: string; op: number }
+  | { type: 'resumeDelivered'; now: number; op: number }
   | { type: 'forcePause'; now: number; minutes: number }
   | { type: 'cancel'; now: number }
   | { type: 'resume'; now: number }
@@ -81,8 +88,8 @@ export type Ev =
 export type Fx =
   | { t: 'toast'; text: string }
   | { t: 'abort' }
-  | { t: 'compact'; instructions: string }
-  | { t: 'submit'; text: string }
+  | { t: 'compact'; instructions: string; op: number }
+  | { t: 'submit'; text: string; op: number }
   | { t: 'fill'; text: string }
 
 export type Result = { state: State; fx: Fx[] }
@@ -98,7 +105,7 @@ export function emptyRec(task = ''): Rec {
 }
 
 export function initialState(): State {
-  return { v: 1, rec: emptyRec(), busy: false, deltas: [], notified: [] }
+  return { v: 1, rec: emptyRec(), busy: false, deltas: [], notified: [], opSeq: 0, known: [] }
 }
 
 // ---------- formatting ----------
@@ -178,6 +185,8 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
   const fx: Fx[] = []
   const toast = (text: string) => fx.push({ t: 'toast', text })
   const r = s.rec
+  if (!s.known) s.known = []
+  const newOp = () => (s.opSeq = (s.opSeq ?? 0) + 1)
 
   const settle = (task = r.task) => {
     s.rec = emptyRec(task)
@@ -195,11 +204,13 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
 
   const startCompact = () => {
     r.phase = 'compacting'
-    fx.push({ t: 'compact', instructions: compactInstructions(r.task) })
+    r.op = newOp()
+    fx.push({ t: 'compact', op: r.op, instructions: compactInstructions(r.task) })
   }
 
   const enterPause = (now: number) => {
     r.phase = 'paused'
+    r.op = undefined
     r.pausedAt = now
     const grace = cfg.graceSec * 1000
     r.wakeAt = r.expectedReset === undefined ? now + backoffMs(r.delayCount) : Math.max(r.expectedReset + grace, now + 5000)
@@ -217,6 +228,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       reason: reasonOverride ?? wins.map(w => describeWindow(w, now)).join('; '),
       expectedReset: resets.length ? Math.max(...resets) : undefined,
       usage: all ? all.windows.map(w => ({ ...w })) : wins.map(w => ({ ...w })),
+      predictive: wins.every(w => w.percent < (limitFor(w.kind, cfg) ?? Infinity)),
     }
     for (const k of Object.keys(r)) delete (r as Record<string, unknown>)[k]
     Object.assign(r, fresh)
@@ -246,6 +258,9 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       return
     }
     r.phase = 'resuming'
+    r.op = newOp()
+    r.delivered = false
+    r.verified = false
     r.resumeAttempts++
     r.lastResumeAt = now
     toast(
@@ -255,10 +270,13 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
           ? 'Reset time passed (usage not re-measured yet). Resuming task to verify.'
           : 'Resuming task.',
     )
-    fx.push({ t: 'submit', text: resumePrompt(r) })
+    fx.push({ t: 'submit', op: r.op, text: resumePrompt(r) })
   }
 
   const resumeFailed = (now: number, why: string, nextReset?: number) => {
+    r.op = undefined
+    r.delivered = false
+    r.verified = false
     r.delayCount++
     if (r.resumeAttempts >= cfg.maxResumeAttempts) {
       r.phase = 'stopped'
@@ -287,6 +305,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     let stale = false
     const kinds = new Set(r.kinds.filter(k => limitFor(k, cfg) !== undefined))
     for (const w of usage.windows) if (limitFor(w.kind, cfg) !== undefined) kinds.add(w.kind)
+    for (const k of s.known) if (limitFor(k, cfg) !== undefined) kinds.add(k)
     for (const k of kinds) {
       const w = usage.windows.find(x => x.kind === k)
       const lim = limitFor(k, cfg) ?? cfg.threshold
@@ -317,7 +336,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
   }
 
   const tickLike = (now: number, usage: Usage | null) => {
-    if (r.phase === 'paused' && r.wakeAt !== undefined && now >= r.wakeAt) wake(now, usage)
+    if (r.phase === 'paused' && cfg.enabled && !s.busy && r.wakeAt !== undefined && now >= r.wakeAt) wake(now, usage)
     // a turn that is running is the resume prompt being answered, however slowly: never time it out
     // (and never queue a second probe behind it); only a prompt that never started is a failure
     else if (r.phase === 'resuming' && !s.busy && r.lastResumeAt !== undefined && now - r.lastResumeAt > RESUME_WATCHDOG_MS) {
@@ -333,6 +352,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
   switch (ev.type) {
     case 'measure': {
       if (typeof ev.usage.contextPercent === 'number') s.ctx = ev.usage.contextPercent
+      for (const w of ev.usage.windows) if (limitFor(w.kind, cfg) !== undefined && !s.known.includes(w.kind)) s.known.push(w.kind)
       if (!cfg.enabled) break
       const u = ev.usage
       const five = u.windows.find(w => w.kind === FIVE)
@@ -350,13 +370,15 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       const hit = breaches(u, s, cfg)
 
       if (r.phase === 'resuming') {
-        // Only a reading that is evidence counts. Below the limit: the reset happened. At or over it
-        // with a reset still ahead: it did not. At or over it with a reset time already past, or a
-        // window missing, is the old reading again (a context-only measurement, an errored turn):
-        // no evidence either way, so keep waiting for the turn's own outcome.
-        const managed = r.kinds.filter(k => limitFor(k, cfg) !== undefined)
+        // Only a reading that is evidence counts. Under the limit in EVERY managed window we have ever
+        // seen: the reset happened. Over it with a reset still ahead: it did not. Over it with a reset
+        // already past, a window missing, or an unchanged snapshot of a burn-rate pause: the old
+        // reading again, no evidence either way, so keep waiting for the turn's own outcome.
+        const managed = new Set(r.kinds.filter(k => limitFor(k, cfg) !== undefined))
+        for (const k of s.known) if (limitFor(k, cfg) !== undefined) managed.add(k)
         const limitedResets: number[] = []
-        let allLow = managed.length > 0
+        let allLow = managed.size > 0
+        let newWindow = false
         for (const k of managed) {
           const w = u.windows.find(x => x.kind === k)
           const lim = limitFor(k, cfg) ?? cfg.threshold
@@ -364,6 +386,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
             allLow = false
             continue
           }
+          if (w.resetsAt !== undefined && w.resetsAt > (r.expectedReset ?? 0) + 120_000) newWindow = true
           if (w.percent >= lim) {
             allLow = false
             if (w.resetsAt !== undefined && w.resetsAt > ev.now) limitedResets.push(w.resetsAt)
@@ -378,10 +401,13 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
         }
         if (limitedResets.length) {
           resumeFailed(ev.now, 'quota still exhausted', Math.max(...limitedResets))
-        } else if (allLow) {
-          const task = r.task
-          settle(task)
-          toast('Quota reset verified.')
+        } else if (allLow && (!r.predictive || newWindow)) {
+          // quota is verified; the task is only done once its continuation was actually delivered
+          if (r.delivered) {
+            const task = r.task
+            settle(task)
+            toast('Quota reset verified.')
+          } else r.verified = true
         }
         break
       }
@@ -418,13 +444,16 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       }
       if (r.phase === 'paused') {
         for (const w of hit) if (!r.kinds.includes(w.kind)) r.kinds.push(w.kind)
-        const managed = r.kinds.filter(k => limitFor(k, cfg) !== undefined)
+        const managed = new Set(r.kinds.filter(k => limitFor(k, cfg) !== undefined))
+        for (const k of s.known) if (limitFor(k, cfg) !== undefined) managed.add(k)
         const blocking: number[] = []
-        let allLow = managed.length > 0
+        let allLow = managed.size > 0
+        let newWindow = false
         for (const k of managed) {
           const w = u.windows.find(x => x.kind === k)
           const lim = limitFor(k, cfg) ?? cfg.threshold
           if (!w || w.percent >= lim) allLow = false
+          if (w && w.resetsAt !== undefined && w.resetsAt > (r.expectedReset ?? 0) + 120_000) newWindow = true
           if (w && w.percent >= lim && w.resetsAt !== undefined && w.resetsAt > ev.now) blocking.push(w.resetsAt)
         }
         if (blocking.length) {
@@ -435,8 +464,9 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
             r.wakeAt = next + cfg.graceSec * 1000
             toast(`Reset time changed; now paused until approximately ${fmtClock(r.wakeAt)}.`)
           }
-        } else if (allLow && r.wakeAt !== undefined && r.wakeAt > ev.now) {
-          // a fresh reading under the limit means the reset already happened: wake at the next check
+        } else if (allLow && (!r.predictive || newWindow) && r.wakeAt !== undefined && r.wakeAt > ev.now) {
+          // a fresh reading under the limit means the reset already happened. A burn-rate pause is not
+          // over when the very reading that caused it comes in again: it needs a new window.
           r.wakeAt = ev.now
         }
       }
@@ -472,6 +502,9 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
         toast('Auto-resume cancelled: you resumed manually.')
       } else if (r.phase === 'resuming') {
         settle(r.task)
+      } else if (r.phase === 'armed' || r.phase === 'compacting') {
+        settle(r.task)
+        toast('Quota pause cancelled: you sent a new prompt.')
       }
       const t = ev.text.trim()
       if (t && !t.startsWith('/') && (t.length >= 12 || !s.rec.task)) s.rec.task = t.slice(0, 4000)
@@ -486,7 +519,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
         }
         break
       }
-      if (r.phase === 'compacting') {
+      if (r.phase === 'compacting' && ev.op === r.op) {
         r.compactedAt = ev.ok ? ev.now : undefined
         r.compactFailed = !ev.ok
         enterPause(ev.now)
@@ -523,7 +556,20 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       break
     }
 
+    case 'resumeDelivered': {
+      if (r.phase !== 'resuming' || ev.op !== r.op) break
+      r.delivered = true
+      if (r.verified) {
+        const task = r.task
+        settle(task)
+        toast('Quota reset verified.')
+      }
+      break
+    }
+
     case 'submitFailed': {
+      if (r.phase !== 'resuming' || ev.op !== r.op) break
+      r.op = undefined
       r.phase = 'stopped'
       r.wakeAt = undefined
       fx.push({ t: 'fill', text: ev.text })
@@ -557,6 +603,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
         break
       }
       r.phase = 'stopped'
+      r.op = undefined
       r.wakeAt = undefined
       toast('Auto-resume cancelled. Use /quota resume or send a prompt to continue.')
       break

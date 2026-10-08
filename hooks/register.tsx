@@ -145,6 +145,7 @@ let lastIdleCompactAt: number | undefined
 let idleTimer: { cancel: () => void } | undefined
 let idleStats: { at: number; before: number; count: number } | undefined
 let warned = false
+let lastTouchAt = 0
 let booted = false
 const STAGGER_MS = 20_000
 const MAX_STAGGER_MS = 120_000
@@ -211,21 +212,47 @@ async function load($: any): Promise<void> {
   testMode = typeof tm === 'boolean' ? tm : typeof options.testMode === 'boolean' ? options.testMode : false
   if (typeof da === 'boolean') dryActions = da
   if (typeof lg === 'boolean') legend = lg
-  S = saved && saved.v === 1 ? saved : initialState() // last: this is what ensure() takes as "loaded"
+  const blank = initialState()
+  S =
+    saved && saved.v === 1
+      ? { ...blank, ...saved, rec: { ...blank.rec, ...saved.rec }, known: saved.known ?? [], opSeq: saved.opSeq ?? 0 }
+      : blank // last: this is what ensure() takes as "loaded"
   await touchIndex($)
 }
 
-// keep the shared store small: remember the most recent sessions and forget older ones
+// Keep the shared store small. Recent sessions stay; older ones are forgotten, EXCEPT records with
+// unresolved recovery (a pause, a resume in flight): those are never discarded. Records written before
+// the index existed are adopted (as the oldest) so they too can age out.
+const INDEX_CAP = 25
+
 async function touchIndex($: any) {
   try {
     const now = await $.clock.now()
+    lastTouchAt = now
     const idx = ((await $.store.get('index')) as { sid: string; at: number }[] | undefined) ?? []
-    const next = [{ sid, at: now }, ...idx.filter(x => x.sid !== sid)]
-    for (const old of next.slice(25)) {
+    const indexed = new Set(idx.map(x => x.sid))
+    let legacy: string[] = []
+    try {
+      legacy = ((await $.store.keys()) as string[])
+        .filter(k => k.startsWith('state:'))
+        .map(k => k.slice('state:'.length))
+        .filter(id => !indexed.has(id) && id !== sid)
+    } catch {
+      /* no key listing available: nothing to migrate */
+    }
+    const entries = [{ sid, at: now }, ...idx.filter(x => x.sid !== sid), ...legacy.map(id => ({ sid: id, at: 0 }))]
+    entries.sort((a, b) => b.at - a.at)
+    const keep = entries.slice(0, INDEX_CAP)
+    for (const old of entries.slice(INDEX_CAP)) {
+      const st = (await $.store.get('state:' + old.sid)) as State | undefined
+      if (st?.rec && st.rec.phase !== 'idle') {
+        keep.push(old)
+        continue
+      }
       await $.store.delete('state:' + old.sid)
       await $.store.delete('idle:' + old.sid)
     }
-    await $.store.set('index', next.slice(0, 25))
+    await $.store.set('index', keep)
   } catch (err) {
     logOnce($, err)
   }
@@ -289,7 +316,14 @@ function ensure($: any): Promise<void> {
   return loading
 }
 
-const persist = ($: any) => $.store.set('state:' + sid, S).catch((err: unknown) => logOnce($, err))
+async function persist($: any) {
+  try {
+    await $.store.set('state:' + sid, S)
+    if ((await $.clock.now()) - lastTouchAt > 10 * 60_000) await touchIndex($)
+  } catch (err) {
+    logOnce($, err)
+  }
+}
 const saveCfg = ($: any) =>
   $.store.set('cfg', { ...cfg, testMode, dryActions, legend, idle: idleCfg }).catch(() => {})
 const saveSim = ($: any) => $.store.set('sim', sim).catch(() => {})
@@ -438,9 +472,9 @@ async function runEffects($: any, list: Fx[]) {
       if (f.t === 'abort') {
         if (turnId) await $.turn.abort({ turnId })
       } else if (f.t === 'compact') {
-        await doCompact($, f.instructions)
+        await doCompact($, f.instructions, f.op)
       } else if (f.t === 'submit') {
-        await doSubmit($, f.text)
+        await doSubmit($, f.text, f.op)
       } else if (f.t === 'fill') {
         await $.prompt.fill({ text: f.text })
       }
@@ -450,7 +484,9 @@ async function runEffects($: any, list: Fx[]) {
   }
 }
 
-async function doCompact($: any, instructions: string) {
+async function doCompact($: any, instructions: string, op: number) {
+  // this operation, and only this one: a cancel, a takeover or a replacement changes S.rec.op
+  const wanted = () => S !== null && S.rec.phase === 'compacting' && S.rec.op === op
   let ok = false
   if (testMode && dryActions) {
     $.ui.log(PREFIX + '[dry-run] would compact the conversation now')
@@ -459,7 +495,7 @@ async function doCompact($: any, instructions: string) {
     // compact rejects while a turn runs; the turn.complete hook that got us
     // here has not returned yet, so retry until the session is idle.
     for (let i = 0; i < 15 && !ok; i++) {
-      if ((S as State).rec.phase !== 'compacting') return // cancelled or superseded while waiting
+      if (!wanted()) return
       try {
         const r = await $.session.compact({ instructions })
         ok = !r || !('skip' in r) || r.skip === undefined
@@ -469,32 +505,34 @@ async function doCompact($: any, instructions: string) {
       }
     }
   }
-  await dispatch($, { type: 'compactDone', now: await $.clock.now(), ok })
+  // a completion for an operation that is no longer current is ignored by the state machine
+  await dispatch($, { type: 'compactDone', now: await $.clock.now(), ok, op })
 }
 
-async function doSubmit($: any, text: string) {
+async function doSubmit($: any, text: string, op: number) {
+  const wanted = () => S !== null && S.rec.phase === 'resuming' && S.rec.op === op
   if (testMode && dryActions) {
     $.ui.log(PREFIX + `[dry-run] would submit: ${text.split('\n')[0]}`)
+    await dispatch($, { type: 'resumeDelivered', now: await $.clock.now(), op })
     $.clock.after(1500, () => void syntheticMeasure($).catch((err: unknown) => logOnce($, err)))
     return
   }
-  // this resume attempt, identified by when it started: anything that cancels, replaces or
-  // supersedes it changes the state, and then the prompt must not be sent
-  const attempt = (S as State).rec.lastResumeAt
-  const stillWanted = () => cfg.enabled && (S as State).rec.phase === 'resuming' && (S as State).rec.lastResumeAt === attempt
   await claimSlot($)
   for (let tries = 0; tries < 2; tries++) {
-    if (!stillWanted()) return
+    if (!wanted()) return // cancelled, taken over, replaced, or the session ended while we waited
     try {
       const r = await $.prompt.submit({ text })
-      if (!r || r.drop === undefined) return
+      if (!r || r.drop === undefined) {
+        await dispatch($, { type: 'resumeDelivered', now: await $.clock.now(), op })
+        return
+      }
     } catch {
       /* retry */
     }
     await $.clock.sleep(5000)
   }
-  if (!stillWanted()) return
-  await dispatch($, { type: 'submitFailed', now: await $.clock.now(), text })
+  if (!wanted()) return
+  await dispatch($, { type: 'submitFailed', now: await $.clock.now(), text, op })
 }
 
 async function syntheticMeasure($: any) {
@@ -539,10 +577,12 @@ async function scheduleIdle($: any) {
   idleTimer = undefined
   if (!idleCfg.enabled || lastResponseAt === undefined || (testMode && dryActions)) return
   const now = await $.clock.now()
+  const tokens0 = await contextTokens($)
+  if (S === null) return
   const plan = planIdleCompact(idleCfg, {
     now,
     lastResponseAt,
-    tokens: await contextTokens($),
+    tokens: tokens0,
     busy: (S as State).busy,
     pending: waiting,
     quotaPhase: (S as State).rec.phase,
@@ -560,6 +600,7 @@ async function runIdle($: any) {
   if (testMode && dryActions) return // dry-run: never touch the real conversation
   const now = await $.clock.now()
   const tokens = await contextTokens($)
+  if (S === null) return
   const plan = planIdleCompact(idleCfg, {
     now,
     lastResponseAt,
@@ -1039,6 +1080,18 @@ export const register: Register = (on, opts) => {
     timer = undefined
     idleTimer?.cancel()
     idleTimer = undefined
+    // Everything in flight belonged to this session: dropping S makes every pending effect stale (they
+    // all check S), and the next hook reloads state for whichever session id is current. /clear changes
+    // the id without a session.start, so this is the only place that can reset it.
+    S = null
+    loading = undefined
+    booted = false
+    turnId = undefined
+    waiting = []
+    lastResponseAt = undefined
+    lastIdleCompactAt = undefined
+    idleStats = undefined
+    lastTouchAt = 0
     return next(e)
   })
 
