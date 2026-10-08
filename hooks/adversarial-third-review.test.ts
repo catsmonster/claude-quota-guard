@@ -154,10 +154,10 @@ test('an old compaction completion after clear cannot finish the new session com
   await command($, 'pause 3')
   await w.clock.advance(1001)
   expect(pending.length).toBe(2)
-  pending[0](summary)
+  pending[0]?.(summary)
   await w.clock.advance(1)
   const observed = (w.store.get('state:s2') as State).rec.phase
-  pending[1](summary)
+  pending[1]?.(summary)
   await w.clock.advance(1)
   expect(observed).toBe('compacting')
 })
