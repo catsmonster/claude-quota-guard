@@ -52,6 +52,65 @@ test('a delivery or failure for an old operation changes nothing', () => {
   const op = woke.rec.op as number
   expect(step(woke, { type: 'resumeDelivered', now: T + 3 * MIN, op: op - 1 }, DEFAULTS).state.rec.delivered).toBe(false)
   expect(step(woke, { type: 'resumeDelivered', now: T + 3 * MIN, op }, DEFAULTS).state.rec.delivered).toBe(true)
+  // a failure naming an older operation does not stop the current resume either
+  const stale = step(woke, { type: 'submitFailed', now: T + 3 * MIN, text: 'x', op: op - 1 }, DEFAULTS)
+  expect(stale.state.rec.phase).toBe('resuming')
+  expect(stale.fx.some(f => f.t === 'fill')).toBe(false)
+})
+
+// ---- verification must be right whichever order delivery and the reading arrive in ----
+// (a test that measures before delivering cannot tell a correct verdict from a wrong one: the resume
+// stays 'resuming' either way. These check the verified flag itself, and also deliver FIRST.)
+const pausedOnFiveWithWeekKnown = () =>
+  run(initialState(), { type: 'measure', now: T, usage: { windows: [five(95), week(40)], contextPercent: 10 } })
+const woken = () => run(pausedOnFiveWithWeekKnown(), { type: 'tick', now: T + 2 * MIN, usage: { windows: [five(95), week(40)] } })
+const deliveredFirst = () => {
+  const s = woken()
+  return run(s, { type: 'resumeDelivered', now: T + 2 * MIN, op: s.rec.op as number })
+}
+const readings: [string, Usage['windows']][] = [
+  ['the known weekly window is missing', [five(3, T + 300 * MIN)]],
+  ['a newly exhausted weekly window has no reset time', [five(3, T + 300 * MIN), { kind: WEEK, percent: 100 }]],
+  ['a newly exhausted weekly window has an expired reset time', [five(3, T + 300 * MIN), { kind: WEEK, percent: 100, resetsAt: T + MIN }]],
+]
+for (const [why, windows] of readings) {
+  test(`not verified when ${why} (measure first, then deliver)`, () => {
+    let s = step(woken(), { type: 'measure', now: T + 3 * MIN, usage: { windows } }, DEFAULTS).state
+    expect(s.rec.verified).not.toBe(true)
+    s = step(s, { type: 'resumeDelivered', now: T + 3 * MIN, op: s.rec.op as number }, DEFAULTS).state
+    expect(s.rec.phase).toBe('resuming')
+  })
+  test(`not verified when ${why} (deliver first, then measure)`, () => {
+    const s = step(deliveredFirst(), { type: 'measure', now: T + 3 * MIN, usage: { windows } }, DEFAULTS).state
+    expect(s.rec.phase).toBe('resuming')
+  })
+}
+
+test('both windows healthy verifies in either order', () => {
+  const healthy = { windows: [five(3, T + 300 * MIN), week(40)] }
+  const measureFirst = step(woken(), { type: 'measure', now: T + 3 * MIN, usage: healthy }, DEFAULTS).state
+  expect(measureFirst.rec.verified).toBe(true)
+  expect(step(measureFirst, { type: 'resumeDelivered', now: T + 3 * MIN, op: measureFirst.rec.op as number }, DEFAULTS).state.rec.phase).toBe('idle')
+  expect(step(deliveredFirst(), { type: 'measure', now: T + 3 * MIN, usage: healthy }, DEFAULTS).state.rec.phase).toBe('idle')
+})
+
+test('verification is withdrawn when a later reading contradicts it, then delivery cannot finish the resume', () => {
+  const verified = step(woken(), { type: 'measure', now: T + 3 * MIN, usage: { windows: [five(3, T + 300 * MIN), week(40)] } }, DEFAULTS).state
+  expect(verified.rec.verified).toBe(true)
+  const contradicted = step(verified, { type: 'measure', now: T + 3 * MIN + 1, usage: { windows: [five(3, T + 300 * MIN), { kind: WEEK, percent: 100 }] } }, DEFAULTS).state
+  expect(contradicted.rec.verified).toBe(false)
+  const delivered = step(contradicted, { type: 'resumeDelivered', now: T + 4 * MIN, op: contradicted.rec.op as number }, DEFAULTS).state
+  expect(delivered.rec.phase).toBe('resuming')
+})
+
+test('a window first seen by boot or by a heartbeat is remembered for verification', () => {
+  const viaBoot = run(initialState(), { type: 'boot', now: T, usage: { windows: [five(95), week(40)], contextPercent: 10 } })
+  expect(viaBoot.known).toContain(WEEK)
+  const viaTick = run(
+    run(initialState(), { type: 'measure', now: T, usage: { windows: [five(95)], contextPercent: 10 } }),
+    { type: 'tick', now: T + 2 * MIN, usage: { windows: [five(3, T + 300 * MIN), week(40)] } },
+  )
+  expect(viaTick.known).toContain(WEEK)
 })
 
 test('a pause is released early by a fresh reading under the limit', () => {

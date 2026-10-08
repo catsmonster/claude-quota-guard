@@ -57,6 +57,9 @@ export type Rec = {
   delivered?: boolean // the session accepted this resume's prompt
   verified?: boolean // quota was seen to have reset (it can be seen before the prompt is delivered)
   predictive?: boolean // paused on the burn-rate prediction, not on a static limit
+  resets?: Record<string, number> // each window's reset time when the pause began: a reset is THAT window moving on
+  verifiedKinds?: string[] // the windows the quota evidence covered when it was taken
+  olderTurnRunning?: boolean // a turn was already running when this resume began: its completion is not ours
 }
 
 export type State = {
@@ -67,14 +70,15 @@ export type State = {
   last?: { pct: number; resetsAt?: number }
   notified: string[]
   ctx?: number // last known context-window fill, %
+  turnId?: string // the main turn that is running
   opSeq: number // source of operation identities
   known: string[] // managed windows ever seen: a resume is only verified if all of them read healthy
 }
 
 export type Ev =
   | { type: 'measure'; now: number; usage: Usage }
-  | { type: 'turnStart' }
-  | { type: 'turnComplete'; now: number; reason: string }
+  | { type: 'turnStart'; turnId?: string }
+  | { type: 'turnComplete'; now: number; reason: string; turnId?: string }
   | { type: 'userPrompt'; now: number; text: string; isUser: boolean }
   | { type: 'compactDone'; now: number; ok: boolean; op?: number; external?: boolean }
   | { type: 'tick'; now: number; usage: Usage | null }
@@ -87,7 +91,7 @@ export type Ev =
 
 export type Fx =
   | { t: 'toast'; text: string }
-  | { t: 'abort' }
+  | { t: 'abort'; op?: number; turnId?: string }
   | { t: 'compact'; instructions: string; op: number }
   | { t: 'submit'; text: string; op: number }
   | { t: 'fill'; text: string }
@@ -187,6 +191,12 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
   const r = s.rec
   if (!s.known) s.known = []
   const newOp = () => (s.opSeq = (s.opSeq ?? 0) + 1)
+  // the windows a resume must see healthy: those that caused the pause plus every managed one ever seen
+  const managedKinds = () => {
+    const m = new Set(r.kinds.filter(k => limitFor(k, cfg) !== undefined))
+    for (const k of s.known) if (limitFor(k, cfg) !== undefined) m.add(k)
+    return m
+  }
 
   const settle = (task = r.task) => {
     s.rec = emptyRec(task)
@@ -229,9 +239,11 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
       expectedReset: resets.length ? Math.max(...resets) : undefined,
       usage: all ? all.windows.map(w => ({ ...w })) : wins.map(w => ({ ...w })),
       predictive: wins.every(w => w.percent < (limitFor(w.kind, cfg) ?? Infinity)),
+      resets: Object.fromEntries((all ? all.windows : wins).filter(w => w.resetsAt !== undefined).map(w => [w.kind, w.resetsAt as number])),
     }
     for (const k of Object.keys(r)) delete (r as Record<string, unknown>)[k]
     Object.assign(r, fresh)
+    r.op = newOp()
     // the worst breached window drives the message and the decision to abort a running turn
     const top = wins.reduce<Win | undefined>((m, w) => (m === undefined || w.percent > m.percent ? w : m), undefined)
     if (top) {
@@ -245,7 +257,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     if (s.busy) {
       if (top && top.percent >= cfg.abortThreshold) {
         r.abortRequested = true
-        fx.push({ t: 'abort' })
+        fx.push({ t: 'abort', op: r.op, turnId: s.turnId })
       }
     } else compactOrPause(now)
   }
@@ -261,6 +273,8 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     r.op = newOp()
     r.delivered = false
     r.verified = false
+    r.verifiedKinds = undefined
+    r.olderTurnRunning = s.busy
     r.resumeAttempts++
     r.lastResumeAt = now
     toast(
@@ -277,6 +291,8 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     r.op = undefined
     r.delivered = false
     r.verified = false
+    r.verifiedKinds = undefined
+    r.olderTurnRunning = false
     r.delayCount++
     if (r.resumeAttempts >= cfg.maxResumeAttempts) {
       r.phase = 'stopped'
@@ -349,10 +365,13 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     if (hit.length) arm(now, hit, usage)
   }
 
+  if (ev.type === 'measure' || ev.type === 'tick' || ev.type === 'boot') {
+    for (const w of ev.usage?.windows ?? []) if (limitFor(w.kind, cfg) !== undefined && !s.known.includes(w.kind)) s.known.push(w.kind)
+  }
+
   switch (ev.type) {
     case 'measure': {
       if (typeof ev.usage.contextPercent === 'number') s.ctx = ev.usage.contextPercent
-      for (const w of ev.usage.windows) if (limitFor(w.kind, cfg) !== undefined && !s.known.includes(w.kind)) s.known.push(w.kind)
       if (!cfg.enabled) break
       const u = ev.usage
       const five = u.windows.find(w => w.kind === FIVE)
@@ -374,10 +393,10 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
         // seen: the reset happened. Over it with a reset still ahead: it did not. Over it with a reset
         // already past, a window missing, or an unchanged snapshot of a burn-rate pause: the old
         // reading again, no evidence either way, so keep waiting for the turn's own outcome.
-        const managed = new Set(r.kinds.filter(k => limitFor(k, cfg) !== undefined))
-        for (const k of s.known) if (limitFor(k, cfg) !== undefined) managed.add(k)
+        const managed = managedKinds()
         const limitedResets: number[] = []
         let allLow = managed.size > 0
+        let anyHigh = false
         let newWindow = false
         for (const k of managed) {
           const w = u.windows.find(x => x.kind === k)
@@ -386,9 +405,11 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
             allLow = false
             continue
           }
-          if (w.resetsAt !== undefined && w.resetsAt > (r.expectedReset ?? 0) + 120_000) newWindow = true
+          // a reset is the window that caused the pause moving on; another window's timestamp says nothing
+          if (r.kinds.includes(k) && w.resetsAt !== undefined && w.resetsAt > (r.resets?.[k] ?? r.expectedReset ?? 0) + 120_000) newWindow = true
           if (w.percent >= lim) {
             allLow = false
+            anyHigh = true
             if (w.resetsAt !== undefined && w.resetsAt > ev.now) limitedResets.push(w.resetsAt)
           }
         }
@@ -398,6 +419,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
           r.kinds.push(w.kind)
           limitedResets.push(w.resetsAt)
           allLow = false
+          anyHigh = true
         }
         if (limitedResets.length) {
           resumeFailed(ev.now, 'quota still exhausted', Math.max(...limitedResets))
@@ -407,7 +429,14 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
             const task = r.task
             settle(task)
             toast('Quota reset verified.')
-          } else r.verified = true
+          } else {
+            r.verified = true
+            r.verifiedKinds = [...managed]
+          }
+        } else if (anyHigh) {
+          // contradicting evidence withdraws an earlier verification
+          r.verified = false
+          r.verifiedKinds = undefined
         }
         break
       }
@@ -438,7 +467,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
         const worst = hit.reduce((m, w) => Math.max(m, w.percent), 0)
         if (s.busy && !r.abortRequested && worst >= cfg.abortThreshold) {
           r.abortRequested = true
-          fx.push({ t: 'abort' })
+          fx.push({ t: 'abort', op: r.op, turnId: s.turnId })
         }
         break
       }
@@ -453,7 +482,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
           const w = u.windows.find(x => x.kind === k)
           const lim = limitFor(k, cfg) ?? cfg.threshold
           if (!w || w.percent >= lim) allLow = false
-          if (w && w.resetsAt !== undefined && w.resetsAt > (r.expectedReset ?? 0) + 120_000) newWindow = true
+          if (w && r.kinds.includes(k) && w.resetsAt !== undefined && w.resetsAt > (r.resets?.[k] ?? r.expectedReset ?? 0) + 120_000) newWindow = true
           if (w && w.percent >= lim && w.resetsAt !== undefined && w.resetsAt > ev.now) blocking.push(w.resetsAt)
         }
         if (blocking.length) {
@@ -475,13 +504,18 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
 
     case 'turnStart':
       s.busy = true
+      s.turnId = ev.turnId
       break
 
     case 'turnComplete': {
       s.busy = false
+      s.turnId = undefined
       if (r.phase === 'armed') {
         if (r.compactedAt !== undefined) enterPause(ev.now)
         else compactOrPause(ev.now)
+      } else if (r.phase === 'resuming' && r.olderTurnRunning) {
+        // that was the turn already running when this resume began, not the continuation's turn
+        r.olderTurnRunning = false
       } else if (r.phase === 'resuming') {
         if (ev.reason === 'error') resumeFailed(ev.now, 'API error')
         else if (ev.reason === 'aborted') {
@@ -559,7 +593,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     case 'resumeDelivered': {
       if (r.phase !== 'resuming' || ev.op !== r.op) break
       r.delivered = true
-      if (r.verified) {
+      if (r.verified && [...managedKinds()].every(k => r.verifiedKinds?.includes(k))) {
         const task = r.task
         settle(task)
         toast('Quota reset verified.')

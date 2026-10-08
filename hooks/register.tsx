@@ -145,6 +145,9 @@ let lastIdleCompactAt: number | undefined
 let idleTimer: { cancel: () => void } | undefined
 let idleStats: { at: number; before: number; count: number } | undefined
 let warned = false
+// bumped when a session ends: everything started before that (loads, effects, retries) belongs to the
+// old session and must neither mutate the new one nor reuse its operation numbers
+let epoch = 0
 let lastTouchAt = 0
 let booted = false
 const STAGGER_MS = 20_000
@@ -171,6 +174,7 @@ let options: Readonly<Record<string, string | number | boolean | readonly string
 const num = (k: string, d: number) => (typeof options[k] === 'number' ? (options[k] as number) : d)
 
 async function load($: any): Promise<void> {
+  const gen = epoch
   await registerCommand($)
   // read and build everything into locals first; publish only when all of it succeeded, so a failure
   // part-way leaves nothing half-initialised for the next hook to mistake for a good start
@@ -204,6 +208,7 @@ async function load($: any): Promise<void> {
     ...(oIdle ?? {}),
   }
 
+  if (gen !== epoch) return // the session ended while this was loading: its state is not ours to publish
   sid = id
   cfg = nextCfg
   idleCfg = nextIdle
@@ -225,6 +230,11 @@ async function load($: any): Promise<void> {
 // the index existed are adopted (as the oldest) so they too can age out.
 const INDEX_CAP = 25
 
+async function recordUnresolved($: any, id: string): Promise<boolean> {
+  const st = (await $.store.get('state:' + id)) as State | undefined
+  return !!(st?.rec && st.rec.phase !== 'idle')
+}
+
 async function touchIndex($: any) {
   try {
     const now = await $.clock.now()
@@ -244,8 +254,12 @@ async function touchIndex($: any) {
     entries.sort((a, b) => b.at - a.at)
     const keep = entries.slice(0, INDEX_CAP)
     for (const old of entries.slice(INDEX_CAP)) {
-      const st = (await $.store.get('state:' + old.sid)) as State | undefined
-      if (st?.rec && st.rec.phase !== 'idle') {
+      if (await recordUnresolved($, old.sid)) {
+        keep.push(old)
+        continue
+      }
+      // another session may have written a pause since that read: look once more right before deleting
+      if (await recordUnresolved($, old.sid)) {
         keep.push(old)
         continue
       }
@@ -306,14 +320,15 @@ async function claimSlot($: any) {
 }
 
 
-function ensure($: any): Promise<void> {
+async function ensure($: any): Promise<void> {
   if (!commandReady) void registerCommand($)
-  if (S) return Promise.resolve()
+  if (S) return
   loading ??= load($).catch(err => {
     loading = undefined
     throw err
   })
-  return loading
+  await loading
+  if (S === null) throw new Error('the session changed while its state was loading')
 }
 
 async function persist($: any) {
@@ -432,14 +447,17 @@ async function publish($: any, usage: Usage | null, now: number) {
 
 async function dispatch($: any, ev: Ev): Promise<void> {
   await ensure($)
+  const gen = epoch
   if ((ev.type === 'measure' || ev.type === 'tick' || ev.type === 'forcePause') && !(await watched($))) return
+  if (gen !== epoch || S === null) return
   const { state, fx } = step(S as State, ev, cfg)
   S = state
   await persist($)
+  if (gen !== epoch) return // the session ended while persisting: nothing this produced applies any more
   sync($)
   for (const f of fx) if (f.t === 'toast') say($, f.text)
   const rest = fx.filter(f => f.t !== 'toast')
-  if (rest.length) void runEffects($, rest).catch((err: unknown) => logOnce($, err))
+  if (rest.length) void runEffects($, rest, gen).catch((err: unknown) => logOnce($, err))
 }
 
 function say($: any, text: string) {
@@ -466,17 +484,20 @@ async function tick($: any) {
   await publish($, usage, now)
 }
 
-async function runEffects($: any, list: Fx[]) {
+async function runEffects($: any, list: Fx[], gen: number) {
   for (const f of list) {
+    if (gen !== epoch) return
     try {
       if (f.t === 'abort') {
-        if (turnId) await $.turn.abort({ turnId })
+        // only the turn this pause was armed against, and only while that pause still stands
+        const live = S !== null && S.rec.phase === 'armed' && S.rec.op === f.op
+        if (live && turnId && (f.turnId === undefined || f.turnId === turnId)) await $.turn.abort({ turnId })
       } else if (f.t === 'compact') {
-        await doCompact($, f.instructions, f.op)
+        await doCompact($, f.instructions, f.op, gen)
       } else if (f.t === 'submit') {
-        await doSubmit($, f.text, f.op)
+        await doSubmit($, f.text, f.op, gen)
       } else if (f.t === 'fill') {
-        await $.prompt.fill({ text: f.text })
+        if (gen === epoch) await $.prompt.fill({ text: f.text })
       }
     } catch (err) {
       $.ui.log(PREFIX + `${f.t} failed: ${String(err)}`)
@@ -484,9 +505,10 @@ async function runEffects($: any, list: Fx[]) {
   }
 }
 
-async function doCompact($: any, instructions: string, op: number) {
-  // this operation, and only this one: a cancel, a takeover or a replacement changes S.rec.op
-  const wanted = () => S !== null && S.rec.phase === 'compacting' && S.rec.op === op
+async function doCompact($: any, instructions: string, op: number, gen: number) {
+  // this operation of this session, and only this one: a cancel, a takeover, a replacement or the end
+  // of the session makes it stale
+  const wanted = () => gen === epoch && S !== null && S.rec.phase === 'compacting' && S.rec.op === op
   let ok = false
   if (testMode && dryActions) {
     $.ui.log(PREFIX + '[dry-run] would compact the conversation now')
@@ -505,12 +527,12 @@ async function doCompact($: any, instructions: string, op: number) {
       }
     }
   }
-  // a completion for an operation that is no longer current is ignored by the state machine
+  if (gen !== epoch) return
   await dispatch($, { type: 'compactDone', now: await $.clock.now(), ok, op })
 }
 
-async function doSubmit($: any, text: string, op: number) {
-  const wanted = () => S !== null && S.rec.phase === 'resuming' && S.rec.op === op
+async function doSubmit($: any, text: string, op: number, gen: number) {
+  const wanted = () => gen === epoch && S !== null && S.rec.phase === 'resuming' && S.rec.op === op
   if (testMode && dryActions) {
     $.ui.log(PREFIX + `[dry-run] would submit: ${text.split('\n')[0]}`)
     await dispatch($, { type: 'resumeDelivered', now: await $.clock.now(), op })
@@ -523,7 +545,7 @@ async function doSubmit($: any, text: string, op: number) {
     try {
       const r = await $.prompt.submit({ text })
       if (!r || r.drop === undefined) {
-        await dispatch($, { type: 'resumeDelivered', now: await $.clock.now(), op })
+        if (gen === epoch) await dispatch($, { type: 'resumeDelivered', now: await $.clock.now(), op })
         return
       }
     } catch {
@@ -843,7 +865,7 @@ export const register: Register = (on, opts) => {
     idleTimer?.cancel()
     idleTimer = undefined
     try {
-      await dispatch($, { type: 'turnStart' })
+      await dispatch($, { type: 'turnStart', turnId: e.turnId })
     } catch (err) {
       logOnce($, err)
     }
@@ -858,7 +880,7 @@ export const register: Register = (on, opts) => {
         // detached: this hook must return before a compaction can run
         const at = await $.clock.now()
         if (e.reason === 'answer' || e.reason === 'refusal') lastResponseAt = at // an errored or interrupted turn refreshed nothing
-        void dispatch($, { type: 'turnComplete', now: at, reason: e.reason })
+        void dispatch($, { type: 'turnComplete', now: at, reason: e.reason, turnId: e.turnId })
           .then(() => scheduleIdle($))
           .catch((err: unknown) => logOnce($, err))
       } catch (err) {
@@ -1083,6 +1105,7 @@ export const register: Register = (on, opts) => {
     // Everything in flight belonged to this session: dropping S makes every pending effect stale (they
     // all check S), and the next hook reloads state for whichever session id is current. /clear changes
     // the id without a session.start, so this is the only place that can reset it.
+    epoch++
     S = null
     loading = undefined
     booted = false

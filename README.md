@@ -122,6 +122,8 @@ No need to burn real quota:
 - Automatic prompts (scheduled tasks, background-task notifications, other plugins) arriving during a pause are **dropped**, not queued, so a completion notice that lands while paused is lost. Your own prompts are never held, and sending one cancels the pause.
 - Resume slots across several sessions are claimed through a shared store without an atomic reservation, so two sessions waking in the same instant can still land close together; the 20-second spacing is best effort.
 - Saved state is kept per session in the plugin's store: the 25 most recently active sessions are retained and older ones are forgotten, except a record with an unresolved pause or resume, which is never discarded. Records written before this existed are adopted on first load.
+- Pruning the shared store re-reads a record right before deleting it, but the plugin store has no compare-and-delete, so a pause written by another session in that instant could still be lost. The window is very small.
+- Session end and `/clear` assume this host reuses the plugin module and may let earlier callbacks survive; every delayed callback is tagged with a session generation so it is ignored if it does. I have not verified that host behaviour live.
 - A session with no UI attached never pauses, and a pause restored into one does not block tools; it resumes when a UI attaches.
 
 ## Develop
