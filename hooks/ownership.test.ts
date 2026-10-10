@@ -57,7 +57,7 @@ test('another turn, with different text, is not mistaken for the continuation', 
   await w.clock.advance(1)
   expect(((await command($, 'status')) as any).text).toContain('State: RESUMING')
   // ...and when the real continuation turn does run, it finishes the resume
-  await startTurn($, 'probe', RESUME_PROMPT)
+  await startTurn($, 'probe', w.seen.submits[0] as string)
   await finishTurn($, 'probe')
   await w.clock.advance(1)
   expect(((await command($, 'status')) as any).text).toContain('State: IDLE')

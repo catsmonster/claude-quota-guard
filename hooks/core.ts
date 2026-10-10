@@ -185,9 +185,13 @@ export function compactInstructions(task: string): string {
   )
 }
 
+// Identifies ONE resume operation: the text is not enough, because every operation shares the same instruction.
+export const resumeMarker = (op: number | undefined) => `[quota-guard recovery #${op ?? 0}]`
+
 export function resumePrompt(r: Rec): string {
   const bits = [RESUME_PROMPT]
   if (r.task) bits.push(`Task before the pause: ${r.task.slice(0, 1500)}`)
+  bits.push(resumeMarker(r.op))
   return bits.join('\n\n')
 }
 
@@ -208,17 +212,31 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
   }
   // Why a window is in the pause: over its limit (static), or only predicted to be (burn rate). A
   // predictive cause is cleared only by THAT window moving on, never by another window's reset.
-  const causeOf = (k: string): 'static' | 'predictive' => r.causes?.[k] ?? (r.predictive ? 'predictive' : 'static')
+  // Records saved before causes existed carry one aggregate flag that cannot describe a mixed pause, so a
+  // window is conservatively predictive unless the snapshot taken when the pause began shows it over its limit.
+  const causeOf = (k: string): 'static' | 'predictive' => {
+    const c = r.causes?.[k]
+    if (c) return c
+    const snap = r.usage.find(x => x.kind === k)
+    if (snap) return snap.percent >= (limitFor(k, cfg) ?? Infinity) ? 'static' : 'predictive'
+    return r.predictive ? 'predictive' : 'static'
+  }
   const advanced = (k: string, w: Win | undefined) =>
     w !== undefined && w.resetsAt !== undefined && w.resetsAt > (r.resets?.[k] ?? r.expectedReset ?? 0) + 120_000
   const predictiveCleared = (u: Usage) => r.kinds.every(k => causeOf(k) !== 'predictive' || advanced(k, u.windows.find(x => x.kind === k)))
   // a window that breaches after the pause began joins it, with its own cause and baseline
   const join = (w: Win) => {
-    if (!r.kinds.includes(w.kind)) r.kinds.push(w.kind)
+    // a cause is acquired fresh when the window was not part of the pause, or when its earlier cause was
+    // resolved by that window moving on: the baseline (and the reason) belong to the window of THIS breach
+    const was = r.kinds.includes(w.kind)
+    const fresh = !was || advanced(w.kind, w)
+    if (!was) r.kinds.push(w.kind)
     r.causes ??= {}
-    r.causes[w.kind] ??= w.percent >= (limitFor(w.kind, cfg) ?? Infinity) ? 'static' : 'predictive'
     r.resets ??= {}
-    if (w.resetsAt !== undefined) r.resets[w.kind] ??= w.resetsAt
+    if (fresh) {
+      r.causes[w.kind] = w.percent >= (limitFor(w.kind, cfg) ?? Infinity) ? 'static' : 'predictive'
+      if (w.resetsAt !== undefined) r.resets[w.kind] = w.resetsAt
+    } else r.causes[w.kind] ??= causeOf(w.kind) // pin what an older record could only imply
   }
 
   const settle = (task = r.task) => {
@@ -616,7 +634,7 @@ export function step(s0: State, ev: Ev, cfg: Config): Result {
     }
 
     case 'tick':
-      if (r.phase === 'resuming' && ev.usage) assessResuming(ev.now, ev.usage, breaches(ev.usage, s, cfg))
+      if (r.phase === 'resuming' && ev.usage && cfg.enabled) assessResuming(ev.now, ev.usage, breaches(ev.usage, s, cfg))
       tickLike(ev.now, ev.usage)
       break
 

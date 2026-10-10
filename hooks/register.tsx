@@ -13,7 +13,7 @@ import {
   fmtDur,
   initialState,
   needsHeartbeat,
-  RESUME_PROMPT,
+  resumeMarker,
   statusLine,
   step,
 } from './core'
@@ -606,9 +606,10 @@ async function contextTokens($: any): Promise<number | undefined> {
 // Idle compaction: while the session waits on background work, compact shortly before the prompt
 // cache expires so the next request does not re-send a huge context at full price. Silent by design.
 async function scheduleIdle($: any, gen: number) {
+  if (gen !== epoch) return // overtaken: the timer now belongs to another session, so do not touch it
   idleTimer?.cancel()
   idleTimer = undefined
-  if (gen !== epoch || !idleCfg.enabled || lastResponseAt === undefined || (testMode && dryActions)) return
+  if (!idleCfg.enabled || lastResponseAt === undefined || (testMode && dryActions)) return
   const now = await $.clock.now()
   const tokens0 = await contextTokens($)
   if (gen !== epoch || S === null) return
@@ -738,6 +739,7 @@ case 'ctx': {
 async function command($: any, args: string, gen: number): Promise<string> {
   const [cmd = 'status', a, b] = args.split(/\s+/)
   const now = await $.clock.now()
+  if (gen !== epoch) return 'Session changed while this command was waiting; it was ignored.'
   switch (cmd.toLowerCase()) {
     case '':
     case 'status': return describe($)
@@ -886,7 +888,7 @@ export const register: Register = (on, opts) => {
     idleTimer = undefined
     try {
       // our own continuation is recognised by its text; anything else that starts is another turn
-      const owns = typeof e.text === 'string' ? e.text.includes(RESUME_PROMPT) : undefined
+      const owns = typeof e.text === 'string' ? e.text.includes(resumeMarker(S?.rec.phase === 'resuming' ? S.rec.op : undefined)) : undefined
       await dispatch($, { type: 'turnStart', turnId: e.turnId, owns }, gen)
     } catch (err) {
       logOnce($, err)
