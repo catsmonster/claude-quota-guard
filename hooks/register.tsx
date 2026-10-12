@@ -266,6 +266,7 @@ async function touchIndex($: any) {
       }
       await $.store.delete('state:' + old.sid)
       await $.store.delete('idle:' + old.sid)
+      await $.store.delete('resp:' + old.sid)
     }
     await $.store.set('index', keep)
   } catch (err) {
@@ -584,6 +585,19 @@ async function boot($: any, gen: number) {
   if (gen !== epoch) return
   $.ui.status(statusLine(S as State, usage, now))
   await publish($, usage, now, gen)
+  // A reload or restart forgets when the last response was. Recover it from the store; with no record, assume
+  // the cache is warm as of now (if it is not, compacting costs about what the next request would have).
+  if (lastResponseAt === undefined) {
+    let saved: unknown
+    try {
+      saved = await $.store.get('resp:' + sid)
+    } catch {
+      /* no record */
+    }
+    if (gen !== epoch) return
+    lastResponseAt = typeof saved === 'number' && saved <= now ? saved : now
+    await scheduleIdle($, gen)
+  }
 }
 
 // ---------- /quota ----------
@@ -911,7 +925,10 @@ export const register: Register = (on, opts) => {
         // detached: this hook must return before a compaction can run
         const at = await $.clock.now()
         if (gen !== epoch) return r
-        if (e.reason === 'answer' || e.reason === 'refusal') lastResponseAt = at // an errored or interrupted turn refreshed nothing
+        if (e.reason === 'answer' || e.reason === 'refusal') {
+          lastResponseAt = at // an errored or interrupted turn refreshed nothing
+          void Promise.resolve($.store.set('resp:' + sid, at)).catch(() => undefined)
+        }
         void dispatch($, { type: 'turnComplete', now: at, reason: e.reason, turnId: e.turnId }, gen)
           .then(() => scheduleIdle($, gen))
           .catch((err: unknown) => logOnce($, err))

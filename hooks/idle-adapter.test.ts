@@ -89,3 +89,13 @@ test('/quota idle reports and changes the settings', async ($, on) => {
   const c: any = await $.command.run({ command: 'quota', args: 'idle min 150k' } as any)
   expect(c.text).toContain('above 150k tokens')
 })
+
+test('a session restored after a reload still gets its idle timer, without waiting for a new response', async ($, on) => {
+  const { clock, seen } = world(on)
+  on('session.attach', (_$: any, e: any) => ({ clientId: e.clientId ?? 'desktop-1' }) as any)
+  await $.session.attach({ surface: 'desktop', clientId: 'desktop-1' } as any)
+  await clock.advance(30 * MIN)
+  expect(seen.compactions.length).toBe(0)
+  await clock.advance(28 * MIN)
+  expect(seen.compactions.length).toBe(1)
+})
