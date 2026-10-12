@@ -661,11 +661,17 @@ async function runIdle($: any, gen: number) {
   }
 }
 
-function idleLine(now: number): string {
+function idleLine(now: number, tokens?: number): string {
   const c = idleCfg
   const n = freshPending(waiting, now).length
   const bits = [`Idle compaction: ${c.enabled ? 'ON' : 'OFF'} (${c.requireWaiting ? 'only while waiting on background work' : 'any idle session'}, above ${Math.round(c.minTokens / 1000)}k tokens, cache ${Math.round(c.ttlMs / 60_000)}m, ${Math.round(c.marginMs / 1000)}s early)`]
   bits.push(n ? `waiting on ${n} background task${n > 1 ? 's' : ''}` : 'not waiting on anything')
+  // why the timer is or is not going to fire: the first thing to check when nothing seems to happen
+  if (lastResponseAt === undefined) bits.push('timer not armed: no response has completed in this session since the mod loaded (reload or restart clears it; the next response arms it)')
+  else {
+    const plan = planIdleCompact(idleCfg, { now, lastResponseAt, tokens, busy: !!S?.busy, pending: waiting, quotaPhase: S?.rec.phase ?? 'idle', lastIdleCompactAt })
+    bits.push(plan.act ? 'compacting now' : plan.at !== undefined ? `armed for ${fmtClock(plan.at)}` : `not firing: ${plan.why}`)
+  }
   if (idleStats) bits.push(`last at ${fmtClock(idleStats.at)} from ${Math.round(idleStats.before / 1000)}k tokens (${idleStats.count} total)`)
   return bits.join('; ')
 }
@@ -688,7 +694,7 @@ async function describe($: any): Promise<string> {
   lines.push(`State: ${r.phase.toUpperCase()}${r.reason ? ` - ${r.reason}` : ''}`)
   if (r.phase === 'paused' && r.wakeAt) lines.push(`Paused until approximately ${fmtClock(r.wakeAt)} (in ${fmtDur(r.wakeAt - now)}); resume attempts used: ${r.resumeAttempts}/${cfg.maxResumeAttempts}`)
   if (r.compactedAt) lines.push(`Compacted at ${fmtClock(r.compactedAt)}${r.compactFailed ? ' (failed)' : ''}`)
-  lines.push(idleLine(now))
+  lines.push(idleLine(now, await contextTokens($)))
   if (r.task) lines.push(`Task on record: ${r.task.slice(0, 160)}${r.task.length > 160 ? '...' : ''}`)
   return lines.join('\n')
 }
@@ -810,7 +816,7 @@ async function command($: any, args: string, gen: number): Promise<string> {
       } else if (a !== undefined && a !== '' && a !== 'status') return 'Usage: /quota idle [on|off|any|waiting|min N|ttl M|margin S]'
       await saveCfg($)
       await scheduleIdle($, gen)
-      return idleLine(now)
+      return idleLine(now, await contextTokens($))
     }
     case 'ctxmin': {
       const n = Number(a)
